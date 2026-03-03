@@ -1,0 +1,648 @@
+# =============================================================================
+# Template: Detect Failure — Container App Log Review
+# =============================================================================
+# Queries the Container App's runtime logs from Log Analytics, then uses the
+# SRE Agent to analyze the logs alongside the webhook alert payload.
+#
+# Flow:
+#   1. Parse the incoming webhook alert payload
+#   2. Query Container App console & system logs via Log Analytics (KQL)
+#   3. Live health check — SRE Agent queries Container App status, replicas,
+#      ingress metrics, and Resource Health to detect false alarms / transient glitches
+#   4. Gate: abort early if the app is healthy now (false alarm)
+#   5. SRE Agent reviews logs → structured triage output
+#   6. Gate: is the issue code-actionable?
+#
+# Outputs: alertSummary, errorSignature, affectedComponent, isActionable,
+#          containerLogs (raw log excerpt for downstream stages)
+# =============================================================================
+
+parameters:
+  - name: azureServiceConnection
+    type: string
+  - name: azureOpenAIEndpoint
+    type: string
+    default: ''
+  - name: azureOpenAIDeployment
+    type: string
+    default: 'agentic-deveops-agent'
+  - name: alertPayload
+    type: string
+  - name: serviceName
+    type: string
+  - name: severity
+    type: string
+  - name: incidentId
+    type: string
+  - name: containerAppName
+    type: string
+    default: ''
+  - name: containerAppResourceGroup
+    type: string
+    default: ''
+  - name: logAnalyticsWorkspace
+    type: string
+    default: ''
+  - name: logTimespan
+    type: string
+    default: 'PT1H'
+  - name: sreAgentResourceGroup
+    type: string
+    default: ''
+  - name: sreAgentName
+    type: string
+    default: ''
+
+steps:
+  # ── Parse Azure Monitor Webhook Payload (if triggered by alert) ────────────
+  - task: PowerShell@2
+    name: ParseWebhook
+    displayName: 'Parse Alert Webhook Payload'
+    inputs:
+      targetType: inline
+      pwsh: true
+      script: |
+        # When triggered by Azure Monitor → Action Group → Incoming Webhook,
+        # the Common Alert Schema payload is available via environment variables
+        # prefixed with the webhook alias (ContainerAppAlert.*).
+        # If triggered manually, these will be empty — fall back to parameters.
+
+        $essentialsSeverity = $env:CONTAINERAPPALERT_DATA_ESSENTIALS_SEVERITY
+        $alertRule          = $env:CONTAINERAPPALERT_DATA_ESSENTIALS_ALERTRULE
+        $alertId            = $env:CONTAINERAPPALERT_DATA_ESSENTIALS_ALERTID
+        $description        = $env:CONTAINERAPPALERT_DATA_ESSENTIALS_DESCRIPTION
+        $firedDateTime      = $env:CONTAINERAPPALERT_DATA_ESSENTIALS_FIREDDATETIME
+        $monitorCondition   = $env:CONTAINERAPPALERT_DATA_ESSENTIALS_MONITORCONDITION
+
+        if ($essentialsSeverity -or $alertRule) {
+          Write-Host "╔══════════════════════════════════════════════╗" -ForegroundColor Green
+          Write-Host "║ ALERT WEBHOOK DETECTED — Parsing payload... ║" -ForegroundColor Green
+          Write-Host "╚══════════════════════════════════════════════╝" -ForegroundColor Green
+          Write-Host "  Alert Rule:   $alertRule"
+          Write-Host "  Severity:     $essentialsSeverity"
+          Write-Host "  Alert ID:     $alertId"
+          Write-Host "  Fired At:     $firedDateTime"
+          Write-Host "  Condition:    $monitorCondition"
+          Write-Host "  Description:  $description"
+
+          # Map Azure Monitor severity (Sev0-Sev4) → pipeline severity
+          $severityMap = @{
+            "Sev0" = "critical"
+            "Sev1" = "high"
+            "Sev2" = "medium"
+            "Sev3" = "low"
+            "Sev4" = "low"
+          }
+          $mappedSeverity = $severityMap[$essentialsSeverity]
+          if (-not $mappedSeverity) { $mappedSeverity = "high" }
+
+          Write-Host "  Mapped severity: $essentialsSeverity → $mappedSeverity" -ForegroundColor Cyan
+
+          # Set output variables that downstream steps can use
+          Write-Host "##vso[task.setvariable variable=webhookSeverity;isOutput=true]$mappedSeverity"
+          Write-Host "##vso[task.setvariable variable=webhookAlertRule;isOutput=true]$alertRule"
+          Write-Host "##vso[task.setvariable variable=webhookAlertId;isOutput=true]$alertId"
+          Write-Host "##vso[task.setvariable variable=webhookDescription;isOutput=true]$description"
+          Write-Host "##vso[task.setvariable variable=webhookFiredAt;isOutput=true]$firedDateTime"
+          Write-Host "##vso[task.setvariable variable=isWebhookTriggered;isOutput=true]true"
+        } else {
+          Write-Host "No webhook payload detected — using manual pipeline parameters." -ForegroundColor Yellow
+          Write-Host "##vso[task.setvariable variable=isWebhookTriggered;isOutput=true]false"
+        }
+
+  # ── Query Container App logs from Log Analytics ────────────────────────────
+  - task: AzureCLI@2
+    name: FetchLogs
+    displayName: 'SRE Agent: Pull Container App Logs'
+    inputs:
+      azureSubscription: '${{ parameters.azureServiceConnection }}'
+      scriptType: pscore
+      scriptLocation: inlineScript
+      inlineScript: |
+        Write-Host "============================================" -ForegroundColor Cyan
+        Write-Host "   SRE AGENT: CONTAINER APP LOG REVIEW       " -ForegroundColor Cyan
+        Write-Host "   App:      ${{ parameters.containerAppName }}" -ForegroundColor Cyan
+        Write-Host "   Severity: ${{ parameters.severity }}"        -ForegroundColor Cyan
+        Write-Host "   Incident: ${{ parameters.incidentId }}"      -ForegroundColor Cyan
+        Write-Host "============================================" -ForegroundColor Cyan
+        Write-Host ""
+
+        $containerApp   = "${{ parameters.containerAppName }}"
+        $containerRG    = "${{ parameters.containerAppResourceGroup }}"
+        $workspaceId    = "${{ parameters.logAnalyticsWorkspace }}"
+        $timespan       = "${{ parameters.logTimespan }}"
+        $subscriptionId = az account show --query id -o tsv
+
+        # ── Auto-discover Log Analytics workspace if not provided ──
+        if (-not $workspaceId) {
+          Write-Host "No workspace ID provided — auto-discovering from Container App..." -ForegroundColor Yellow
+
+          if (-not $containerRG) {
+            # Try to find the Container App's resource group
+            Write-Host "Searching for Container App '$containerApp'..."
+            $caInfo = az containerapp show --name $containerApp --query "{rg:resourceGroup, envId:properties.environmentId}" -o json 2>$null | ConvertFrom-Json
+            if ($caInfo) {
+              $containerRG = $caInfo.rg
+              Write-Host "  Found in resource group: $containerRG"
+            } else {
+              # Search across subscription
+              $caSearch = az containerapp list --query "[?name=='$containerApp'] | [0].{rg:resourceGroup, envId:properties.environmentId}" -o json 2>$null | ConvertFrom-Json
+              if ($caSearch) { $containerRG = $caSearch.rg }
+            }
+          }
+
+          if ($containerRG) {
+            # Get the Container App Environment, then its Log Analytics config
+            $envId = az containerapp show -n $containerApp -g $containerRG --query "properties.environmentId" -o tsv 2>$null
+            if ($envId) {
+              $envName = ($envId -split '/')[-1]
+              $envRG = ($envId -split '/')[4]
+              $laConfig = az containerapp env show -n $envName -g $envRG --query "properties.appLogsConfiguration.logAnalyticsConfiguration.customerId" -o tsv 2>$null
+              if ($laConfig) {
+                $workspaceId = $laConfig
+                Write-Host "  Discovered workspace: $workspaceId" -ForegroundColor Green
+              }
+            }
+          }
+        }
+
+        if (-not $workspaceId) {
+          Write-Host "##[warning]Could not determine Log Analytics workspace. Falling back to alert-only mode."
+          Write-Host "##vso[task.setvariable variable=consoleLogs;isOutput=true]"
+          Write-Host "##vso[task.setvariable variable=systemLogs;isOutput=true]"
+          Write-Host "##vso[task.setvariable variable=workspaceFound;isOutput=true]false"
+          exit 0
+        }
+
+        Write-Host "##vso[task.setvariable variable=workspaceFound;isOutput=true]true"
+
+        # ── Query ContainerAppConsoleLogs (application stdout/stderr) ──
+        Write-Host ""
+        Write-Host "Querying Container App console logs (errors & warnings)..." -ForegroundColor Yellow
+
+        $consoleKql = @"
+        ContainerAppConsoleLogs_CL
+        | where ContainerAppName_s == '$containerApp'
+        | where Log_s has_any ('error', 'exception', 'fail', 'critical', 'fatal', 'traceback', 'panic', 'WARN', 'ERR')
+        | project TimeGenerated, Log_s, ContainerName_s, RevisionName_s
+        | order by TimeGenerated desc
+        | take 80
+        "@
+
+        $consoleLogs = az monitor log-analytics query `
+          --workspace $workspaceId `
+          --analytics-query $consoleKql `
+          --timespan $timespan `
+          -o json 2>$null
+
+        if ($LASTEXITCODE -ne 0 -or -not $consoleLogs) {
+          Write-Host "##[warning]Console log query failed or returned no results"
+          $consoleLogs = "[]"
+        }
+
+        $consoleRows = $consoleLogs | ConvertFrom-Json
+        Write-Host "  Retrieved $($consoleRows.Count) console log entries" -ForegroundColor Green
+
+        Write-Host "##[group]Container App Console Logs"
+        foreach ($row in $consoleRows | Select-Object -First 30) {
+          $ts = if ($row.TimeGenerated) { $row.TimeGenerated } else { "?" }
+          $msg = if ($row.Log_s) { $row.Log_s.Substring(0, [Math]::Min(200, $row.Log_s.Length)) } else { "" }
+          Write-Host "[$ts] $msg"
+        }
+        Write-Host "##[endgroup]"
+
+        # ── Query ContainerAppSystemLogs (platform-level events) ──
+        Write-Host "Querying Container App system logs..." -ForegroundColor Yellow
+
+        $systemKql = @"
+        ContainerAppSystemLogs_CL
+        | where ContainerAppName_s == '$containerApp'
+        | where Type_s has_any ('Error', 'Warning', 'Failed')
+            or Reason_s has_any ('BackOff', 'CrashLoopBackOff', 'Unhealthy', 'Failed', 'OOMKilled', 'FailedScheduling')
+        | project TimeGenerated, Type_s, Reason_s, Log_s, RevisionName_s
+        | order by TimeGenerated desc
+        | take 30
+        "@
+
+        $systemLogs = az monitor log-analytics query `
+          --workspace $workspaceId `
+          --analytics-query $systemKql `
+          --timespan $timespan `
+          -o json 2>$null
+
+        if ($LASTEXITCODE -ne 0 -or -not $systemLogs) {
+          $systemLogs = "[]"
+        }
+
+        $systemRows = $systemLogs | ConvertFrom-Json
+        Write-Host "  Retrieved $($systemRows.Count) system log entries" -ForegroundColor Green
+
+        Write-Host "##[group]Container App System Logs"
+        foreach ($row in $systemRows | Select-Object -First 20) {
+          Write-Host "[$($row.TimeGenerated)] $($row.Type_s)/$($row.Reason_s): $($row.Log_s)"
+        }
+        Write-Host "##[endgroup]"
+
+        # ── Build combined log excerpt for downstream stages ──
+        $logExcerpt = ""
+
+        if ($consoleRows.Count -gt 0) {
+          $logExcerpt += "=== CONTAINER APP CONSOLE LOGS (errors/warnings) ===`n"
+          foreach ($row in $consoleRows | Select-Object -First 50) {
+            $logExcerpt += "[$($row.TimeGenerated)] $($row.Log_s)`n"
+          }
+        }
+
+        if ($systemRows.Count -gt 0) {
+          $logExcerpt += "`n=== CONTAINER APP SYSTEM LOGS ===`n"
+          foreach ($row in $systemRows | Select-Object -First 20) {
+            $logExcerpt += "[$($row.TimeGenerated)] $($row.Type_s)/$($row.Reason_s): $($row.Log_s)`n"
+          }
+        }
+
+        # Truncate to fit ADO variable limits (~32KB safe)
+        if ($logExcerpt.Length -gt 30000) {
+          $logExcerpt = $logExcerpt.Substring(0, 30000) + "`n... [truncated]"
+        }
+
+        # Save to artifact + output variable
+        $logExcerpt | Out-File "$(Build.ArtifactStagingDirectory)/container_logs.txt" -Encoding utf8
+        Write-Host "##vso[task.setvariable variable=consoleLogs;isOutput=true]$($consoleLogs -replace '[\r\n]+', ' ')"
+        Write-Host "##vso[task.setvariable variable=systemLogs;isOutput=true]$($systemLogs -replace '[\r\n]+', ' ')"
+
+  # ── Health Check: Is the Container App running normally NOW? ────────────────
+  - task: AzureCLI@2
+    name: HealthCheck
+    displayName: 'SRE Agent: Container App Live Health Check'
+    inputs:
+      azureSubscription: '${{ parameters.azureServiceConnection }}'
+      scriptType: pscore
+      scriptLocation: inlineScript
+      inlineScript: |
+        Write-Host "============================================" -ForegroundColor Cyan
+        Write-Host "   SRE AGENT: LIVE HEALTH CHECK              " -ForegroundColor Cyan
+        Write-Host "   Checking if Container App is healthy NOW   " -ForegroundColor Cyan
+        Write-Host "============================================" -ForegroundColor Cyan
+        Write-Host ""
+
+        $helpersPath = "$(Agent.TempDirectory)/sre-agent-helpers.ps1"
+        if (Test-Path $helpersPath) { . $helpersPath }
+
+        $containerApp = "${{ parameters.containerAppName }}"
+        $containerRG  = "${{ parameters.containerAppResourceGroup }}"
+        $subscriptionId = az account show --query id -o tsv
+        $mgmtToken = az account get-access-token --resource https://management.azure.com --query accessToken -o tsv
+        $aiToken   = az account get-access-token --resource https://cognitiveservices.azure.com --query accessToken -o tsv
+
+        $healthSignals = @()
+        $isHealthyNow  = $true
+
+        # ── 1. Check Container App provisioning & running state ──
+        Write-Host "Checking Container App status..." -ForegroundColor Yellow
+        $caStatus = az containerapp show -n $containerApp -g $containerRG `
+          --query "{state:properties.provisioningState, runState:properties.runningStatus.state, latestRevision:properties.latestRevisionName, trafficWeight:properties.template.revisionSuffix}" `
+          -o json 2>$null | ConvertFrom-Json
+
+        if ($caStatus) {
+          Write-Host "  Provisioning: $($caStatus.state)"
+          Write-Host "  Running:      $($caStatus.runState)"
+          Write-Host "  Revision:     $($caStatus.latestRevision)"
+          $healthSignals += "ProvisioningState: $($caStatus.state), RunningStatus: $($caStatus.runState)"
+
+          if ($caStatus.runState -ne "Running" -or $caStatus.state -ne "Succeeded") {
+            $isHealthyNow = $false
+          }
+        } else {
+          Write-Host "  ##[warning]Could not query Container App status"
+          $healthSignals += "Container App status: UNKNOWN"
+        }
+
+        # ── 2. Check all revision replicas ──
+        Write-Host "Checking revision replicas..." -ForegroundColor Yellow
+        $replicas = az containerapp replica list -n $containerApp -g $containerRG `
+          --query "[].{name:name, running:properties.runningState, ready:properties.readyState, restarts:properties.containers[0].restartCount}" `
+          -o json 2>$null | ConvertFrom-Json
+
+        if ($replicas) {
+          foreach ($r in $replicas) {
+            $state = if ($r.running) { $r.running } else { "Unknown" }
+            $restarts = if ($r.restarts) { $r.restarts } else { 0 }
+            Write-Host "  Replica: $($r.name) | State: $state | Restarts: $restarts"
+            if ($state -ne "Running" -or $restarts -gt 3) {
+              $isHealthyNow = $false
+            }
+          }
+          $healthSignals += "Replicas: $($replicas.Count) total"
+        } else {
+          Write-Host "  Could not enumerate replicas (may require latest revision name)"
+        }
+
+        # ── 3. Check recent ingress (last 5 min of request success/errors) ──
+        Write-Host "Checking recent ingress traffic..." -ForegroundColor Yellow
+        $resourceId = "/subscriptions/$subscriptionId/resourceGroups/$containerRG/providers/Microsoft.App/containerApps/$containerApp"
+
+        try {
+          $metricsUri = "https://management.azure.com${resourceId}/providers/Microsoft.Insights/metrics?api-version=2023-10-01&metricnames=Requests,RestartCount&timespan=PT5M&interval=PT1M"
+          $metrics = Invoke-RestMethod -Uri $metricsUri -Headers @{ "Authorization" = "Bearer $mgmtToken" } -TimeoutSec 20
+
+          foreach ($m in $metrics.value) {
+            $metricName = $m.name.value
+            $latest = $m.timeseries | ForEach-Object { $_.data } | Select-Object -Last 1
+            $val = if ($latest.total) { $latest.total } elseif ($latest.count) { $latest.count } else { "N/A" }
+            Write-Host "  $metricName (last 5 min): $val"
+            $healthSignals += "$metricName`: $val"
+          }
+        } catch {
+          Write-Host "  ##[warning]Could not fetch ingress metrics: $_"
+        }
+
+        # ── 4. Check Azure Resource Health ──
+        Write-Host "Checking Azure Resource Health..." -ForegroundColor Yellow
+        $health = Get-AzureResourceHealth -ResourceId $resourceId -Token $mgmtToken
+        Write-Host "  Health status: $($health.status)"
+        Write-Host "  Summary:       $($health.summary)"
+        $healthSignals += "ResourceHealth: $($health.status)"
+
+        if ($health.status -eq "Unavailable" -or $health.status -eq "Degraded") {
+          $isHealthyNow = $false
+        }
+
+        # ── 5. SRE Agent: Assess overall health ──
+        Write-Host ""
+        Write-Host "Asking SRE Agent to assess current health..." -ForegroundColor Yellow
+
+        $healthContext = @"
+        CONTAINER APP: $containerApp
+        RESOURCE GROUP: $containerRG
+
+        LIVE HEALTH SIGNALS (queried just now):
+        $($healthSignals -join "`n")
+
+        ORIGINAL ALERT SEVERITY: ${{ parameters.severity }}
+        ORIGINAL ALERT INCIDENT: ${{ parameters.incidentId }}
+
+        INSTRUCTIONS:
+        You received an alert for this Container App, but before investigating further
+        we need to know if this was a false alarm or transient issue. Based on the LIVE
+        health signals above (NOT the original alert), determine:
+
+        1. currentStatus - "healthy", "degraded", or "unhealthy"
+        2. isFalseAlarm - "true" if the app is running normally now and the alert was
+           likely a transient glitch, network blip, or false positive. "false" if
+           there are still signs of a real problem.
+        3. reason - Brief explanation of your assessment
+
+        Respond ONLY in valid JSON with exactly these three keys.
+        "@
+
+        $sreResult = Invoke-SREAgentAPI `
+          -Action "diagnostics" `
+          -Context $healthContext `
+          -Token $aiToken `
+          -Endpoint "${{ parameters.azureOpenAIEndpoint }}" `
+          -Deployment "${{ parameters.azureOpenAIDeployment }}" `
+          -SubscriptionId $subscriptionId `
+          -SREAgentName "${{ parameters.sreAgentName }}" `
+          -SREAgentResourceGroup "${{ parameters.sreAgentResourceGroup }}"
+
+        $currentStatus = "unknown"
+        $isFalseAlarm  = "false"
+        $reason        = ""
+
+        if ($sreResult.success) {
+          try {
+            $parsed = $sreResult.response | ConvertFrom-Json -ErrorAction Stop
+            if ($parsed.currentStatus) { $currentStatus = $parsed.currentStatus }
+            if ($parsed.isFalseAlarm)  { $isFalseAlarm  = "$($parsed.isFalseAlarm)".ToLower() }
+            if ($parsed.reason)        { $reason = $parsed.reason }
+          } catch {
+            $reason = $sreResult.response.Substring(0, [Math]::Min(200, $sreResult.response.Length))
+            # If AI couldn't parse, fall back to our own signals
+            if ($isHealthyNow) { $isFalseAlarm = "true"; $currentStatus = "healthy" }
+          }
+
+          Write-Host ""
+          Write-Host "SRE Agent health assessment:" -ForegroundColor Cyan
+          Write-Host $sreResult.response
+        } else {
+          # AI unavailable — use our direct signal checks
+          if ($isHealthyNow) {
+            $currentStatus = "healthy"
+            $isFalseAlarm = "true"
+            $reason = "All live health checks passed — Container App is running normally."
+          } else {
+            $currentStatus = "unhealthy"
+            $isFalseAlarm = "false"
+            $reason = "One or more live health checks failed."
+          }
+        }
+
+        Write-Host ""
+        Write-Host "HEALTH CHECK RESULT:" -ForegroundColor $(if ($isFalseAlarm -eq "true") { "Yellow" } else { "Red" })
+        Write-Host "  Current Status: $currentStatus"
+        Write-Host "  False Alarm:    $isFalseAlarm"
+        Write-Host "  Reason:         $reason"
+
+        Write-Host "##vso[task.setvariable variable=currentStatus;isOutput=true]$currentStatus"
+        Write-Host "##vso[task.setvariable variable=isFalseAlarm;isOutput=true]$isFalseAlarm"
+        Write-Host "##vso[task.setvariable variable=healthReason;isOutput=true]$($reason -replace '[\r\n]+', ' ')"
+
+  # ── Gate: Abort early if this is a false alarm ─────────────────────────────
+  - task: PowerShell@2
+    displayName: 'Gate: False alarm check'
+    inputs:
+      targetType: inline
+      pwsh: true
+      script: |
+        $isFalseAlarm = "$(HealthCheck.isFalseAlarm)"
+        $status       = "$(HealthCheck.currentStatus)"
+        $reason       = "$(HealthCheck.healthReason)"
+
+        if ($isFalseAlarm -eq "true") {
+          Write-Host "============================================" -ForegroundColor Green
+          Write-Host "   FALSE ALARM — Container App is healthy    " -ForegroundColor Green
+          Write-Host "============================================" -ForegroundColor Green
+          Write-Host ""
+          Write-Host "  Status: $status"
+          Write-Host "  Reason: $reason"
+          Write-Host ""
+          Write-Host "The alert was likely a transient glitch, network blip, or false positive."
+          Write-Host "Skipping root cause analysis and code fix generation."
+          Write-Host "##vso[task.complete result=SucceededWithIssues;]False alarm — $reason"
+          exit 1
+        }
+
+        Write-Host "Container App is NOT healthy ($status) — proceeding with log analysis." -ForegroundColor Yellow
+        Write-Host "  Reason: $reason"
+
+  # ── SRE Agent: Analyze logs + alert payload ────────────────────────────────
+  - task: AzureCLI@2
+    name: DetectAlert
+    displayName: 'SRE Agent: Analyze Logs & Triage Alert'
+    inputs:
+      azureSubscription: '${{ parameters.azureServiceConnection }}'
+      scriptType: pscore
+      scriptLocation: inlineScript
+      inlineScript: |
+        Write-Host "============================================" -ForegroundColor Cyan
+        Write-Host "   SRE AGENT: LOG ANALYSIS & TRIAGE          " -ForegroundColor Cyan
+        Write-Host "============================================" -ForegroundColor Cyan
+        Write-Host ""
+
+        $helpersPath = "$(Agent.TempDirectory)/sre-agent-helpers.ps1"
+        if (Test-Path $helpersPath) { . $helpersPath } else {
+          Write-Host "##vso[task.logissue type=warning]SRE helpers not found — ensure sre-agent-common.yml ran first"
+        }
+
+        $aiToken = az account get-access-token --resource https://cognitiveservices.azure.com --query accessToken -o tsv
+        $subscriptionId = az account show --query id -o tsv
+
+        # ── Parse the webhook alert payload ──
+        $rawPayload = @'
+        ${{ parameters.alertPayload }}
+        '@.Trim()
+
+        Write-Host "##[group]Webhook Alert Payload"
+        try {
+          $payloadObj = $rawPayload | ConvertFrom-Json
+          $rawPayload | Write-Host
+        } catch {
+          Write-Host $rawPayload
+          $payloadObj = @{ raw_message = $rawPayload }
+        }
+        Write-Host "##[endgroup]"
+
+        # ── Load Container App logs from previous step ──
+        $containerLogs = ""
+        $logFile = "$(Build.ArtifactStagingDirectory)/container_logs.txt"
+        if (Test-Path $logFile) {
+          $containerLogs = Get-Content $logFile -Raw -ErrorAction SilentlyContinue
+          Write-Host "Loaded $($containerLogs.Length) chars of Container App logs" -ForegroundColor Green
+        } else {
+          Write-Host "No Container App logs available — using alert payload only" -ForegroundColor Yellow
+        }
+
+        # ── SRE Agent: Combined log + alert analysis ──
+        Write-Host "Sending logs + alert to SRE Agent for analysis..." -ForegroundColor Yellow
+
+        $analysisContext = @"
+        SERVICE: ${{ parameters.serviceName }}
+        CONTAINER APP: ${{ parameters.containerAppName }}
+        SEVERITY: ${{ parameters.severity }}
+        INCIDENT_ID: ${{ parameters.incidentId }}
+
+        === WEBHOOK ALERT PAYLOAD ===
+        $($payloadObj | ConvertTo-Json -Depth 10 -Compress)
+
+        === CONTAINER APP RUNTIME LOGS ===
+        $containerLogs
+
+        INSTRUCTIONS:
+        You are an SRE agent triaging a Container App failure. Analyze BOTH the alert
+        payload AND the runtime logs above. Extract the following:
+
+        1. alertSummary - A concise one-line summary of the failure based on the logs
+        2. errorSignature - The specific error message, exception type, stack trace pattern,
+           or HTTP status code found in the logs
+        3. affectedComponent - The service, module, class, or file most likely causing the error
+           (look for file references, class names, or function names in stack traces)
+        4. isActionable - "true" if the logs show a code-level bug that can be fixed in the
+           repository, "false" if it's infrastructure/config/transient
+
+        Prioritize information from the RUNTIME LOGS over the alert payload when available.
+        Look for stack traces, exception types, and error messages that point to specific code.
+
+        Respond ONLY in valid JSON with exactly these four keys.
+        "@
+
+        $sreResult = Invoke-SREAgentAPI `
+          -Action "diagnostics" `
+          -Context $analysisContext `
+          -Token $aiToken `
+          -Endpoint "${{ parameters.azureOpenAIEndpoint }}" `
+          -Deployment "${{ parameters.azureOpenAIDeployment }}" `
+          -SubscriptionId $subscriptionId `
+          -SREAgentName "${{ parameters.sreAgentName }}" `
+          -SREAgentResourceGroup "${{ parameters.sreAgentResourceGroup }}"
+
+        # ── Parse the AI response ──
+        $alertSummary      = "Unknown failure"
+        $errorSignature    = "Unknown error"
+        $affectedComponent = "${{ parameters.serviceName }}"
+        $isActionable      = "true"
+
+        if ($sreResult.success) {
+          try {
+            $parsed = $sreResult.response | ConvertFrom-Json -ErrorAction Stop
+            if ($parsed.alertSummary)       { $alertSummary = $parsed.alertSummary }
+            if ($parsed.errorSignature)     { $errorSignature = $parsed.errorSignature }
+            if ($parsed.affectedComponent)  { $affectedComponent = $parsed.affectedComponent }
+            if ($parsed.isActionable)       { $isActionable = "$($parsed.isActionable)" }
+          } catch {
+            $alertSummary = $sreResult.response.Substring(0, [Math]::Min(200, $sreResult.response.Length))
+          }
+
+          Write-Host "SRE Agent response:" -ForegroundColor Cyan
+          Write-Host $sreResult.response
+        } else {
+          Write-Host "##[warning]AI log analysis failed — using heuristic fallback"
+          if ($payloadObj.title)          { $alertSummary = "$($payloadObj.title)" }
+          elseif ($payloadObj.alertName)  { $alertSummary = "$($payloadObj.alertName)" }
+          elseif ($payloadObj.message)    { $alertSummary = "$($payloadObj.message)" }
+
+          if ($payloadObj.error.message)  { $errorSignature = "$($payloadObj.error.message)" }
+          elseif ($payloadObj.statusCode) { $errorSignature = "$($payloadObj.statusCode)" }
+
+          if ($payloadObj.component)      { $affectedComponent = "$($payloadObj.component)" }
+          elseif ($payloadObj.resource)   { $affectedComponent = "$($payloadObj.resource)" }
+        }
+
+        # Sanitize for ADO output variables
+        $alertSummary       = ($alertSummary       -replace '[\r\n]+', ' ').Trim()
+        $errorSignature     = ($errorSignature     -replace '[\r\n]+', ' ').Trim()
+        $affectedComponent  = ($affectedComponent  -replace '[\r\n]+', ' ').Trim()
+
+        # Build a compact log excerpt for passing between stages
+        $logExcerptForVar = if ($containerLogs.Length -gt 4000) {
+          $containerLogs.Substring(0, 4000) + "... [truncated]"
+        } else { $containerLogs }
+        $logExcerptForVar = ($logExcerptForVar -replace '[\r\n]+', ' ').Trim()
+
+        # ── Set output variables ──
+        Write-Host "##vso[task.setvariable variable=alertSummary;isOutput=true]$alertSummary"
+        Write-Host "##vso[task.setvariable variable=errorSignature;isOutput=true]$errorSignature"
+        Write-Host "##vso[task.setvariable variable=affectedComponent;isOutput=true]$affectedComponent"
+        Write-Host "##vso[task.setvariable variable=isActionable;isOutput=true]$isActionable"
+        Write-Host "##vso[task.setvariable variable=containerLogs;isOutput=true]$logExcerptForVar"
+
+        Write-Host ""
+        Write-Host "LOG ANALYSIS RESULTS:" -ForegroundColor Green
+        Write-Host "  Summary:    $alertSummary"
+        Write-Host "  Error:      $errorSignature"
+        Write-Host "  Component:  $affectedComponent"
+        Write-Host "  Actionable: $isActionable"
+        Write-Host "  Log chars:  $($containerLogs.Length)"
+
+  # ── Publish log artifacts ──────────────────────────────────────────────────
+  - task: PublishPipelineArtifact@1
+    displayName: 'Publish Container App logs'
+    condition: always()
+    inputs:
+      targetPath: '$(Build.ArtifactStagingDirectory)'
+      artifact: 'container-logs'
+      publishLocation: 'pipeline'
+
+  # ── Gate: Abort if alert is not actionable ─────────────────────────────────
+  - task: PowerShell@2
+    displayName: 'Gate: Is alert actionable?'
+    inputs:
+      targetType: inline
+      pwsh: true
+      script: |
+        $actionable = "$(DetectAlert.isActionable)"
+        if ($actionable -ne "true") {
+          Write-Host "##[warning]Alert is not actionable (infrastructure/config/transient issue)."
+          Write-Host "##vso[task.complete result=SucceededWithIssues;]Alert not actionable — no code fix needed"
+          exit 1
+        }
+        Write-Host "Alert is actionable (code-level bug) — proceeding to diagnosis." -ForegroundColor Green

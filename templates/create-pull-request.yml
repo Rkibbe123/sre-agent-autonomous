@@ -1,0 +1,311 @@
+# =============================================================================
+# Template: Create Pull Request (Autonomous Pipeline)
+# =============================================================================
+# Creates an Azure DevOps PR from the fix branch back to the target branch
+# in the ms-inventory repo, with a rich description including the Container
+# App log analysis, root cause, and code changes.
+# =============================================================================
+
+parameters:
+  - name: azureServiceConnection
+    type: string
+  - name: azureOpenAIEndpoint
+    type: string
+    default: ''
+  - name: azureOpenAIDeployment
+    type: string
+    default: 'agentic-deveops-agent'
+  - name: targetProject
+    type: string
+  - name: targetRepo
+    type: string
+  - name: targetBranch
+    type: string
+  - name: fixBranch
+    type: string
+  - name: workingDirectory
+    type: string
+  - name: serviceName
+    type: string
+  - name: incidentId
+    type: string
+  - name: severity
+    type: string
+  - name: fixSummary
+    type: string
+  - name: changedFiles
+    type: string
+  - name: testResults
+    type: string
+
+steps:
+  # ── Create the Pull Request via Azure DevOps REST API ──────────────────────
+  - task: AzureCLI@2
+    name: CreatePR
+    displayName: 'Create Pull Request'
+    inputs:
+      azureSubscription: '${{ parameters.azureServiceConnection }}'
+      scriptType: pscore
+      scriptLocation: inlineScript
+      inlineScript: |
+        Write-Host "============================================" -ForegroundColor Cyan
+        Write-Host "   SRE AGENT: CREATE PULL REQUEST            " -ForegroundColor Cyan
+        Write-Host "============================================" -ForegroundColor Cyan
+
+        $orgUrl      = "$(System.CollectionUri)".TrimEnd("/")
+        $project     = "${{ parameters.targetProject }}"
+        $repoName    = "${{ parameters.targetRepo }}"
+        $pat         = "$(System.AccessToken)"
+        $encodedPat  = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(":$pat"))
+
+        $severity    = "${{ parameters.severity }}"
+        $service     = "${{ parameters.serviceName }}"
+        $incidentId  = "${{ parameters.incidentId }}"
+        $fixSummary  = "${{ parameters.fixSummary }}"
+        $changedFiles = "${{ parameters.changedFiles }}"
+        $testResults = "${{ parameters.testResults }}"
+        $buildUrl    = "$orgUrl/$project/_build/results?buildId=$(Build.BuildId)"
+
+        # ── Look up repository ID ──
+        Write-Host "Looking up repository: $repoName"
+        $reposUrl = "$orgUrl/$project/_apis/git/repositories?api-version=7.1"
+        $reposResp = Invoke-RestMethod -Uri $reposUrl -Headers @{ Authorization = "Basic $encodedPat" } -TimeoutSec 30
+
+        $repo = $reposResp.value | Where-Object { $_.name -ieq $repoName } | Select-Object -First 1
+        if (-not $repo) {
+          $repo = $reposResp.value | Where-Object { $_.remoteUrl -match [regex]::Escape($repoName) } | Select-Object -First 1
+        }
+        if (-not $repo) {
+          Write-Host "##[error]Repository '$repoName' not found."
+          Write-Host "Available: $($reposResp.value.name -join ', ')"
+          exit 1
+        }
+
+        $repoId = $repo.id
+        Write-Host "Repository ID: $repoId"
+
+        # ── Build severity badge ──
+        $sevEmoji = switch ($severity) {
+          "critical" { "🔴" }
+          "high"     { "🟠" }
+          "medium"   { "🟡" }
+          "low"      { "🟢" }
+          default    { "⚪" }
+        }
+
+        # ── Build PR title & description ──
+        $prTitle = if ($fixSummary.Length -gt 5) {
+          "SRE Auto-Fix: $($fixSummary.Substring(0, [Math]::Min(80, $fixSummary.Length)))"
+        } else {
+          "SRE Auto-Fix for incident $incidentId"
+        }
+
+        $fileList = ($changedFiles -split '[,;]' | ForEach-Object { "- ``$($_.Trim())``" }) -join "`n"
+
+        $prDescription = @"
+        ## SRE Autonomous Agent — Auto-Fix
+
+        $sevEmoji **Severity:** $($severity.ToUpper())
+        **Service:** $service
+        **Incident:** $incidentId
+
+        ---
+
+        ### Fix Summary
+
+        $fixSummary
+
+        ### Changed Files
+
+        $fileList
+
+        ### Validation Results
+
+        $testResults
+
+        ### Links
+
+        - [Pipeline Run]($buildUrl)
+
+        ---
+
+        > **This PR was generated automatically by the SRE Autonomous Agent.**
+        > Please review carefully before merging.
+        "@
+
+        # ── Create the PR ──
+        $prUrl = "$orgUrl/$project/_apis/git/repositories/$repoId/pullrequests?api-version=7.1"
+
+        $prBody = @{
+          sourceRefName = "refs/heads/${{ parameters.fixBranch }}"
+          targetRefName = "refs/heads/${{ parameters.targetBranch }}"
+          title         = $prTitle
+          description   = $prDescription.Trim()
+          isDraft       = $false
+          labels        = @(
+            @{ name = "sre-agent" }
+            @{ name = "severity-$severity" }
+            @{ name = "auto-generated" }
+          )
+        } | ConvertTo-Json -Depth 10
+
+        Write-Host "Creating PR: ${{ parameters.fixBranch }} → ${{ parameters.targetBranch }}"
+
+        $prResp = Invoke-RestMethod -Uri $prUrl `
+          -Method POST `
+          -Headers @{
+            Authorization  = "Basic $encodedPat"
+            "Content-Type" = "application/json"
+          } `
+          -Body $prBody `
+          -TimeoutSec 30
+
+        $prId  = $prResp.pullRequestId
+        $prWeb = "$orgUrl/$project/_git/$repoName/pullrequest/$prId"
+
+        Write-Host "##vso[task.setvariable variable=prId;isOutput=true]$prId"
+        Write-Host "##vso[task.setvariable variable=prUrl;isOutput=true]$prWeb"
+        Write-Host "##vso[task.setvariable variable=repositoryId;isOutput=true]$repoId"
+
+        Write-Host ""
+        Write-Host "PR CREATED:" -ForegroundColor Green
+        Write-Host "  PR ID:  $prId"
+        Write-Host "  PR URL: $prWeb"
+
+  # ── Add detailed analysis comment to the PR ────────────────────────────────
+  - task: AzureCLI@2
+    displayName: 'Add analysis comment to PR'
+    inputs:
+      azureSubscription: '${{ parameters.azureServiceConnection }}'
+      scriptType: pscore
+      scriptLocation: inlineScript
+      inlineScript: |
+        $orgUrl      = "$(System.CollectionUri)".TrimEnd("/")
+        $project     = "${{ parameters.targetProject }}"
+        $repoId      = "$(CreatePR.repositoryId)"
+        $prId        = "$(CreatePR.prId)"
+        $pat         = "$(System.AccessToken)"
+        $encodedPat  = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(":$pat"))
+        $buildUrl    = "$orgUrl/$project/_build/results?buildId=$(Build.BuildId)"
+
+        $comment = @"
+        ## SRE Agent Analysis Report
+
+        ### Root Cause & Fix
+        ${{ parameters.fixSummary }}
+
+        ### Files Modified
+        $((${{ parameters.changedFiles }} -split '[,;]' | ForEach-Object { "- ``$($_.Trim())``" }) -join "`n")
+
+        ### Validation Results
+        ${{ parameters.testResults }}
+
+        ### Pipeline Details
+        [View full pipeline run]($buildUrl)
+
+        ---
+        *Generated by SRE Autonomous Agent — review all changes carefully.*
+        "@
+
+        $threadUrl = "$orgUrl/$project/_apis/git/repositories/$repoId/pullRequests/$prId/threads?api-version=7.1"
+        $threadBody = @{
+          comments = @(@{
+            parentCommentId = 0
+            content         = $comment.Trim()
+            commentType     = "text"
+          })
+          status = "active"
+        } | ConvertTo-Json -Depth 10
+
+        Invoke-RestMethod -Uri $threadUrl `
+          -Method POST `
+          -Headers @{ Authorization = "Basic $encodedPat"; "Content-Type" = "application/json" } `
+          -Body $threadBody `
+          -TimeoutSec 30
+
+        Write-Host "Analysis comment added to PR #$prId" -ForegroundColor Green
+
+  # ── Auto-approve & auto-complete (low/medium severity) ─────────────────────
+  - task: AzureCLI@2
+    displayName: 'Auto-approve & auto-complete (low/medium only)'
+    inputs:
+      azureSubscription: '${{ parameters.azureServiceConnection }}'
+      scriptType: pscore
+      scriptLocation: inlineScript
+      inlineScript: |
+        $severity = "${{ parameters.severity }}"
+
+        if ($severity -in @("high", "critical")) {
+          Write-Host "Severity is '$severity' — auto-approve NOT enabled. Human review required." -ForegroundColor Yellow
+          return
+        }
+
+        Write-Host "Severity is '$severity' — auto-approving PR..." -ForegroundColor Green
+
+        $orgUrl      = "$(System.CollectionUri)".TrimEnd("/")
+        $project     = "${{ parameters.targetProject }}"
+        $repoId      = "$(CreatePR.repositoryId)"
+        $prId        = "$(CreatePR.prId)"
+        $pat         = "$(System.AccessToken)"
+        $encodedPat  = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(":$pat"))
+        $headers     = @{ Authorization = "Basic $encodedPat"; "Content-Type" = "application/json" }
+
+        # ── Get the build service identity ──
+        $prUrl = "$orgUrl/$project/_apis/git/repositories/$repoId/pullRequests/$prId`?api-version=7.1"
+        $pr = Invoke-RestMethod -Uri $prUrl -Headers @{ Authorization = "Basic $encodedPat" } -TimeoutSec 30
+        $creatorId = $pr.createdBy.id
+
+        # ── Auto-approve: cast vote = 10 (Approved) as the build service ──
+        $reviewerUrl = "$orgUrl/$project/_apis/git/repositories/$repoId/pullRequests/$prId/reviewers/$creatorId`?api-version=7.1"
+        $voteBody = @{ vote = 10 } | ConvertTo-Json
+
+        try {
+          Invoke-RestMethod -Uri $reviewerUrl -Method PUT -Headers $headers -Body $voteBody -TimeoutSec 30
+          Write-Host "PR #$prId approved by build service identity" -ForegroundColor Green
+        } catch {
+          Write-Host "##[warning]Auto-approve failed: $_"
+          Write-Host "The build service identity may not have permission to approve PRs."
+          Write-Host "Grant 'Contribute to pull requests' to the build service on the target repo."
+        }
+
+        # ── Auto-complete: merge automatically once policies pass ──
+        $updateBody = @{
+          autoCompleteSetBy = @{ id = $creatorId }
+          completionOptions = @{
+            mergeStrategy       = "squash"
+            deleteSourceBranch  = $true
+            transitionWorkItems = $true
+            mergeCommitMessage  = "SRE Agent auto-fix (PR #$prId)"
+          }
+        } | ConvertTo-Json -Depth 10
+
+        try {
+          Invoke-RestMethod -Uri $prUrl -Method PATCH -Headers $headers -Body $updateBody -TimeoutSec 30
+          Write-Host "Auto-complete enabled on PR #$prId" -ForegroundColor Green
+        } catch {
+          Write-Host "##[warning]Auto-complete failed: $_"
+        }
+
+        Write-Host ""
+        Write-Host "PR #$prId: auto-approved + auto-complete ($severity severity)" -ForegroundColor Green
+
+  # ── Final summary ──────────────────────────────────────────────────────────
+  - task: PowerShell@2
+    displayName: 'Log PR summary'
+    inputs:
+      targetType: inline
+      pwsh: true
+      script: |
+        Write-Host "============================================" -ForegroundColor Green
+        Write-Host "   PULL REQUEST CREATED                      " -ForegroundColor Green
+        Write-Host "============================================" -ForegroundColor Green
+        Write-Host ""
+        Write-Host "  PR ID:     $(CreatePR.prId)"
+        Write-Host "  PR URL:    $(CreatePR.prUrl)"
+        Write-Host "  Source:    ${{ parameters.fixBranch }}"
+        Write-Host "  Target:    ${{ parameters.targetBranch }}"
+        Write-Host "  Service:   ${{ parameters.serviceName }}"
+        Write-Host "  Incident:  ${{ parameters.incidentId }}"
+        Write-Host "  Severity:  ${{ parameters.severity }}"
+        Write-Host ""
+        Write-Host "============================================" -ForegroundColor Green

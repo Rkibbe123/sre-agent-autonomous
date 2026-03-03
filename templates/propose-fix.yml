@@ -1,0 +1,334 @@
+# =============================================================================
+# Template: Propose Fix (Autonomous Pipeline)
+# =============================================================================
+# Uses Azure OpenAI to generate code changes that fix the error identified in
+# the Container App logs. Applies changes to a fix branch, validates, pushes.
+# =============================================================================
+
+parameters:
+  - name: azureServiceConnection
+    type: string
+  - name: azureOpenAIEndpoint
+    type: string
+    default: ''
+  - name: azureOpenAIDeployment
+    type: string
+    default: 'agentic-deveops-agent'
+  - name: targetProject
+    type: string
+  - name: targetRepo
+    type: string
+  - name: targetBranch
+    type: string
+  - name: fixBranch
+    type: string
+  - name: workingDirectory
+    type: string
+  - name: rootCauseAnalysis
+    type: string
+  - name: affectedFiles
+    type: string
+  - name: suggestedFix
+    type: string
+  - name: sreAgentResourceGroup
+    type: string
+    default: ''
+  - name: sreAgentName
+    type: string
+    default: ''
+
+steps:
+  # ── Clone and prepare fix branch ───────────────────────────────────────────
+  - task: AzureCLI@2
+    name: PrepareBranch
+    displayName: 'Prepare fix branch'
+    inputs:
+      azureSubscription: '${{ parameters.azureServiceConnection }}'
+      scriptType: pscore
+      scriptLocation: inlineScript
+      inlineScript: |
+        $orgUrl = "$(System.CollectionUri)".TrimEnd("/")
+        $project = "${{ parameters.targetProject }}"
+        $repoName = "${{ parameters.targetRepo }}"
+        $pat = "$(System.AccessToken)"
+        $encodedPat = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(":$pat"))
+
+        $workDir = "${{ parameters.workingDirectory }}"
+
+        if (-not (Test-Path "$workDir/.git")) {
+          $cloneUrl = "$orgUrl/$project/_git/$repoName"
+          Write-Host "Cloning: $cloneUrl"
+          git -c http.extraHeader="Authorization: Basic $encodedPat" clone `
+            --branch "${{ parameters.targetBranch }}" --depth 50 `
+            "$cloneUrl" "$workDir"
+        }
+
+        Set-Location $workDir
+
+        # Configure git for commits
+        git config user.email "sre-agent@devops.azure.com"
+        git config user.name "SRE Autonomous Agent"
+        git config http.extraHeader "Authorization: Basic $encodedPat"
+
+        # Create fix branch
+        git checkout -b "${{ parameters.fixBranch }}"
+        Write-Host "Created branch: ${{ parameters.fixBranch }}" -ForegroundColor Green
+
+  # ── Generate code fix via SRE Agent / AI ───────────────────────────────────
+  - task: AzureCLI@2
+    name: GenerateFix
+    displayName: 'SRE Agent: Generate code fix'
+    inputs:
+      azureSubscription: '${{ parameters.azureServiceConnection }}'
+      scriptType: pscore
+      scriptLocation: inlineScript
+      inlineScript: |
+        Write-Host "============================================" -ForegroundColor Cyan
+        Write-Host "   SRE AGENT: GENERATE CODE FIX             " -ForegroundColor Cyan
+        Write-Host "============================================" -ForegroundColor Cyan
+
+        $helpersPath = "$(Agent.TempDirectory)/sre-agent-helpers.ps1"
+        if (Test-Path $helpersPath) { . $helpersPath }
+
+        $aiToken = az account get-access-token --resource https://cognitiveservices.azure.com --query accessToken -o tsv
+        $subscriptionId = az account show --query id -o tsv
+
+        Set-Location "${{ parameters.workingDirectory }}"
+
+        $rootCause    = "${{ parameters.rootCauseAnalysis }}"
+        $suggestedFix = "${{ parameters.suggestedFix }}"
+        $affectedFilesRaw = "${{ parameters.affectedFiles }}"
+
+        # Parse affected files list
+        $affectedFiles = $affectedFilesRaw -split '[,;]' | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+
+        if ($affectedFiles.Count -eq 0) {
+          Write-Host "##[error]No affected files specified by diagnosis"
+          exit 1
+        }
+
+        Write-Host "Generating fixes for $($affectedFiles.Count) file(s):" -ForegroundColor Yellow
+        $affectedFiles | ForEach-Object { Write-Host "  - $_" }
+
+        $changedFiles = @()
+
+        foreach ($filePath in $affectedFiles) {
+          # Normalize path
+          $cleanPath = $filePath -replace '^\.\/', ''
+          $fullPath = Join-Path "${{ parameters.workingDirectory }}" $cleanPath
+
+          if (-not (Test-Path $fullPath)) {
+            Write-Host "##[warning]File not found: $cleanPath — skipping"
+            continue
+          }
+
+          $originalContent = Get-Content $fullPath -Raw -ErrorAction SilentlyContinue
+          if (-not $originalContent) {
+            Write-Host "##[warning]Could not read: $cleanPath — skipping"
+            continue
+          }
+
+          Write-Host "`nGenerating fix for: $cleanPath" -ForegroundColor Yellow
+
+          $fixContext = @"
+          ROOT CAUSE: $rootCause
+          SUGGESTED FIX: $suggestedFix
+          ALL AFFECTED FILES: $affectedFilesRaw
+
+          FILE TO FIX: $cleanPath
+
+          CURRENT FILE CONTENT:
+          $originalContent
+
+          INSTRUCTIONS:
+          Apply the minimal necessary changes to fix the bug described above.
+          Preserve all existing functionality, formatting, and style.
+          Add brief comments explaining the fix where appropriate.
+          Return ONLY the complete fixed file content — no explanations, no markdown fences,
+          no text before or after the file content.
+          "@
+
+          $sreResult = Invoke-SREAgentAPI `
+            -Action "mitigate" `
+            -Context $fixContext `
+            -Token $aiToken `
+            -Endpoint "${{ parameters.azureOpenAIEndpoint }}" `
+            -Deployment "${{ parameters.azureOpenAIDeployment }}" `
+            -SubscriptionId $subscriptionId `
+            -SREAgentName "${{ parameters.sreAgentName }}" `
+            -SREAgentResourceGroup "${{ parameters.sreAgentResourceGroup }}"
+
+          if ($sreResult.success -and $sreResult.response) {
+            $fixedContent = $sreResult.response
+
+            # Strip markdown code fences if the model wrapped them
+            if ($fixedContent -match '(?s)^```\w*\r?\n(.+?)\r?\n```\s*$') {
+              $fixedContent = $Matches[1]
+            }
+
+            if ($fixedContent.Trim() -ne $originalContent.Trim()) {
+              Set-Content -Path $fullPath -Value $fixedContent -Encoding utf8 -NoNewline
+              $changedFiles += $cleanPath
+              Write-Host "  Fixed: $cleanPath" -ForegroundColor Green
+            } else {
+              Write-Host "  No changes needed for: $cleanPath" -ForegroundColor Yellow
+            }
+          } else {
+            Write-Host "##[warning]AI fix generation failed for: $cleanPath"
+          }
+        }
+
+        if ($changedFiles.Count -eq 0) {
+          Write-Host "##[error]No files were changed — fix generation failed"
+          exit 1
+        }
+
+        # Generate a concise fix summary
+        $summaryContext = @"
+        Root cause: $rootCause
+        Suggested fix: $suggestedFix
+        Files changed: $($changedFiles -join ', ')
+
+        Generate a concise 1-2 sentence summary of this code fix for a Pull Request title.
+        Be specific about what was changed and why. Return only the summary text.
+        "@
+
+        $summaryResult = Invoke-SREAgentAPI `
+          -Action "diagnostics" `
+          -Context $summaryContext `
+          -Token $aiToken `
+          -Endpoint "${{ parameters.azureOpenAIEndpoint }}" `
+          -Deployment "${{ parameters.azureOpenAIDeployment }}" `
+          -SubscriptionId $subscriptionId `
+          -SREAgentName "${{ parameters.sreAgentName }}" `
+          -SREAgentResourceGroup "${{ parameters.sreAgentResourceGroup }}"
+
+        $fixSummary = if ($summaryResult.success) { ($summaryResult.response -replace '[\r\n]+', ' ').Trim() }
+                      else { "Auto-fix: $suggestedFix" }
+
+        $changedList = ($changedFiles -join ', ') -replace '[\r\n]+', ' '
+
+        Write-Host "##vso[task.setvariable variable=fixSummary;isOutput=true]$fixSummary"
+        Write-Host "##vso[task.setvariable variable=changedFiles;isOutput=true]$changedList"
+
+        Write-Host "`nFIX SUMMARY:" -ForegroundColor Green
+        Write-Host "  Summary: $fixSummary"
+        Write-Host "  Changed: $changedList"
+
+  # ── Display the diff ───────────────────────────────────────────────────────
+  - task: PowerShell@2
+    displayName: 'Display generated diff'
+    inputs:
+      targetType: inline
+      pwsh: true
+      workingDirectory: '${{ parameters.workingDirectory }}'
+      script: |
+        Write-Host "##[group]Generated diff"
+        git diff --stat
+        Write-Host "---"
+        git diff
+        Write-Host "##[endgroup]"
+
+        # Verify changes exist
+        $hasChanges = git diff --quiet; $diffExit = $LASTEXITCODE
+        if ($diffExit -eq 0) {
+          Write-Host "##[error]No code changes were generated."
+          exit 1
+        }
+
+  # ── Validate the fix (basic lint/syntax) ───────────────────────────────────
+  - task: PowerShell@2
+    name: ValidateFix
+    displayName: 'Validate fix (lint, syntax)'
+    continueOnError: true
+    inputs:
+      targetType: inline
+      pwsh: true
+      workingDirectory: '${{ parameters.workingDirectory }}'
+      script: |
+        Write-Host "============================================" -ForegroundColor Cyan
+        Write-Host "   VALIDATE FIX                              " -ForegroundColor Cyan
+        Write-Host "============================================" -ForegroundColor Cyan
+
+        $results = @()
+
+        # Detect project type
+        $projectType = "unknown"
+        if (Test-Path "requirements.txt" -or Test-Path "pyproject.toml" -or Test-Path "setup.py") { $projectType = "python" }
+        elseif (Test-Path "package.json") { $projectType = "node" }
+        elseif (Get-ChildItem -Filter "*.csproj" -Recurse -Depth 2) { $projectType = "dotnet" }
+        elseif (Test-Path "go.mod") { $projectType = "go" }
+
+        Write-Host "Detected project type: $projectType"
+
+        switch ($projectType) {
+          "python" {
+            # Syntax check changed .py files
+            $pyFiles = git diff --name-only | Where-Object { $_ -match '\.py$' }
+            foreach ($f in $pyFiles) {
+              if (Test-Path $f) {
+                $r = python -m py_compile $f 2>&1
+                $results += @{ label = "py_compile $f"; passed = ($LASTEXITCODE -eq 0); detail = "$r" }
+              }
+            }
+          }
+          "node" {
+            if (Test-Path "tsconfig.json") {
+              npx tsc --noEmit 2>&1 | Out-Null
+              $results += @{ label = "tsc --noEmit"; passed = ($LASTEXITCODE -eq 0) }
+            }
+          }
+          "dotnet" {
+            dotnet build --no-restore 2>&1 | Out-Null
+            $results += @{ label = "dotnet build"; passed = ($LASTEXITCODE -eq 0) }
+          }
+          "go" {
+            go vet ./... 2>&1 | Out-Null
+            $results += @{ label = "go vet"; passed = ($LASTEXITCODE -eq 0) }
+          }
+          default {
+            Write-Host "No validator for '$projectType' — skipping"
+          }
+        }
+
+        $total  = $results.Count
+        $passed = ($results | Where-Object { $_.passed }).Count
+        $summary = if ($total -eq 0) { "SKIPPED: no validator" } else { "$passed/$total checks passed" }
+
+        Write-Host "##vso[task.setvariable variable=testResults;isOutput=true]$summary"
+        Write-Host "`nValidation: $summary" -ForegroundColor $(if ($passed -eq $total) { "Green" } else { "Yellow" })
+
+  # ── Commit and push the fix branch ─────────────────────────────────────────
+  - task: AzureCLI@2
+    displayName: 'Commit & push fix branch'
+    inputs:
+      azureSubscription: '${{ parameters.azureServiceConnection }}'
+      scriptType: pscore
+      scriptLocation: inlineScript
+      inlineScript: |
+        Set-Location "${{ parameters.workingDirectory }}"
+
+        $pat = "$(System.AccessToken)"
+        $encodedPat = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(":$pat"))
+        git config http.extraHeader "Authorization: Basic $encodedPat"
+
+        git add -A
+
+        $fixSummary = "$(GenerateFix.fixSummary)"
+        $commitMsg = @"
+        fix: SRE Agent auto-fix for Build $(Build.BuildId)
+
+        $fixSummary
+
+        Generated by SRE Autonomous Agent pipeline (Build $(Build.BuildId)).
+        "@
+
+        git commit -m ($commitMsg.Trim())
+
+        git push origin "${{ parameters.fixBranch }}"
+        if ($LASTEXITCODE -ne 0) {
+          Write-Host "##[error]Failed to push fix branch"
+          exit 1
+        }
+
+        Write-Host "Pushed branch: ${{ parameters.fixBranch }}" -ForegroundColor Green

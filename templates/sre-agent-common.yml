@@ -1,0 +1,384 @@
+# =============================================================================
+# SRE Agent Common Utilities Template
+# =============================================================================
+# Shared helper steps for Azure SRE Agent integration across all pipelines.
+# Handles authentication, CLI setup, API calls, and response parsing.
+#
+# Usage:
+#   - template: templates/sre-agent-common.yml
+#     parameters:
+#       azureServiceConnection: 'azure-devops-sp2'
+#       action: 'setup'  # setup | diagnostics | readiness | audit | baseline
+#
+# Prerequisites:
+#   - Azure service connection with Contributor or SRE Agent Operator role
+#   - Azure SRE Agent resource provisioned in target subscription
+#   - Azure Monitor workspace connected to target services
+# =============================================================================
+
+parameters:
+  - name: azureServiceConnection
+    type: string
+    displayName: 'Azure Service Connection'
+  - name: action
+    type: string
+    default: 'setup'
+    values:
+      - setup
+      - diagnostics
+      - readiness
+      - audit
+      - baseline
+      - mitigate
+  - name: sreAgentResourceGroup
+    type: string
+    default: ''
+    displayName: 'SRE Agent Resource Group'
+  - name: sreAgentName
+    type: string
+    default: ''
+    displayName: 'SRE Agent Instance Name'
+  - name: targetResourceId
+    type: string
+    default: ''
+    displayName: 'Target Azure Resource ID for diagnostics'
+  - name: azureOpenAIEndpoint
+    type: string
+    default: ''
+  - name: azureOpenAIDeployment
+    type: string
+    default: 'agentic-deveops-agent'
+  - name: subscriptionId
+    type: string
+    default: ''
+
+steps:
+  # ──────────────────────────────────────────────
+  # STEP 1: Install/verify Azure SRE Agent CLI extension
+  # ──────────────────────────────────────────────
+  - task: AzureCLI@2
+    name: SREAgentSetup
+    displayName: 'SRE Agent: Install CLI & Authenticate'
+    inputs:
+      azureSubscription: '${{ parameters.azureServiceConnection }}'
+      scriptType: pscore
+      scriptLocation: inlineScript
+      inlineScript: |
+        Write-Host "============================================" -ForegroundColor Cyan
+        Write-Host "   AZURE SRE AGENT - SETUP & AUTH           " -ForegroundColor Cyan
+        Write-Host "============================================" -ForegroundColor Cyan
+
+        # Install the SRE Agent CLI extension (idempotent)
+        Write-Host "Installing/updating Azure SRE Agent CLI extension..."
+        az extension add --name sre-agent --upgrade --yes 2>$null
+        if ($LASTEXITCODE -ne 0) {
+          Write-Host "##vso[task.logissue type=warning]SRE Agent CLI extension not yet available - falling back to REST API mode"
+          Write-Host "##vso[task.setvariable variable=SRE_CLI_AVAILABLE;isOutput=true]false"
+        } else {
+          Write-Host "SRE Agent CLI extension installed successfully"
+          Write-Host "##vso[task.setvariable variable=SRE_CLI_AVAILABLE;isOutput=true]true"
+        }
+
+        # Get management token for ARM REST API calls
+        $mgmtToken = az account get-access-token --resource https://management.azure.com --query accessToken -o tsv
+        Write-Host "##vso[task.setvariable variable=SRE_MGMT_TOKEN;isOutput=true;issecret=true]$mgmtToken"
+
+        # Get AI token for Azure OpenAI agent calls
+        $aiToken = az account get-access-token --resource https://cognitiveservices.azure.com --query accessToken -o tsv
+        Write-Host "##vso[task.setvariable variable=SRE_AI_TOKEN;isOutput=true;issecret=true]$aiToken"
+
+        # Get subscription context
+        $subId = "${{ parameters.subscriptionId }}"
+        if (-not $subId) {
+          $subId = az account show --query id -o tsv
+        }
+        Write-Host "##vso[task.setvariable variable=SRE_SUBSCRIPTION_ID;isOutput=true]$subId"
+        Write-Host "Subscription: $subId"
+
+        # Verify Azure Monitor connectivity
+        Write-Host "Verifying Azure Monitor connectivity..."
+        try {
+          $monitorCheck = az monitor metrics list --resource "/subscriptions/$subId" --metric "Availability" --interval PT1H 2>$null
+          Write-Host "Azure Monitor: Connected"
+        } catch {
+          Write-Host "##vso[task.logissue type=warning]Azure Monitor connectivity could not be verified"
+        }
+
+        Write-Host ""
+        Write-Host "SRE Agent setup complete." -ForegroundColor Green
+
+  # ──────────────────────────────────────────────
+  # STEP 2: Create reusable PowerShell helper functions
+  # ──────────────────────────────────────────────
+  - task: PowerShell@2
+    name: SREHelpers
+    displayName: 'SRE Agent: Initialize Helper Functions'
+    inputs:
+      targetType: inline
+      pwsh: true
+      script: |
+        # Write shared helper script to disk for other steps to dot-source
+        $helpersPath = "$(Agent.TempDirectory)/sre-agent-helpers.ps1"
+
+        $helperScript = @'
+        # ===== SRE Agent Shared Helper Functions =====
+
+        function Invoke-SREAgentAPI {
+            <#
+            .SYNOPSIS
+                Calls Azure SRE Agent REST API or falls back to Azure OpenAI with SRE-specific prompting.
+            .PARAMETER Action
+                The SRE action: diagnostics, readiness, audit, baseline, mitigate
+            .PARAMETER TargetResourceId
+                Azure resource ID to diagnose/analyze
+            .PARAMETER Context
+                Additional context string (logs, metrics, etc.)
+            .PARAMETER Token
+                Bearer token for authentication
+            .PARAMETER Endpoint
+                Azure OpenAI endpoint URL (fallback)
+            .PARAMETER Deployment
+                Azure OpenAI deployment name (fallback)
+            #>
+            param(
+                [Parameter(Mandatory)][string]$Action,
+                [string]$TargetResourceId = "",
+                [string]$Context = "",
+                [Parameter(Mandatory)][string]$Token,
+                [string]$Endpoint = "",
+                [string]$Deployment = "agentic-deveops-agent",
+                [string]$SubscriptionId = "",
+                [string]$SREAgentName = "",
+                [string]$SREAgentResourceGroup = ""
+            )
+
+            $result = @{ success = $false; response = ""; raw = $null }
+
+            # Try SRE Agent REST API first (if resource is provisioned)
+            if ($SREAgentName -and $SREAgentResourceGroup -and $SubscriptionId) {
+                try {
+                    $sreApiBase = "https://management.azure.com/subscriptions/$SubscriptionId/resourceGroups/$SREAgentResourceGroup/providers/Microsoft.App/agents/$SREAgentName"
+                    $apiVersion = "2025-05-01-preview"
+
+                    $sreBody = @{
+                        properties = @{
+                            action = $Action
+                            targetResourceId = $TargetResourceId
+                            context = $Context
+                        }
+                    } | ConvertTo-Json -Depth 10
+
+                    $sreResponse = Invoke-RestMethod -Uri "$sreApiBase/actions?api-version=$apiVersion" `
+                        -Method POST `
+                        -Headers @{
+                            "Authorization" = "Bearer $Token"
+                            "Content-Type" = "application/json"
+                        } `
+                        -Body $sreBody `
+                        -TimeoutSec 120
+
+                    $result.success = $true
+                    $result.raw = $sreResponse
+                    $result.response = $sreResponse | ConvertTo-Json -Depth 10
+                    return $result
+                } catch {
+                    Write-Host "  SRE Agent API call failed, falling back to AI agent: $_" -ForegroundColor Yellow
+                }
+            }
+
+            # Fallback: Use Azure OpenAI with SRE-specific system prompt
+            if ($Endpoint) {
+                $sreSystemPrompt = Get-SRESystemPrompt -Action $Action
+                $body = @{
+                    model = $Deployment
+                    max_completion_tokens = 16384
+                    reasoning_effort = "high"
+                    messages = @(
+                        @{ role = "system"; content = $sreSystemPrompt }
+                        @{ role = "user"; content = "**TARGET RESOURCE:** $TargetResourceId`n**ACTION REQUESTED:** $Action`n`n**CONTEXT DATA:**`n$Context" }
+                    )
+                } | ConvertTo-Json -Depth 10
+
+                try {
+                    $response = Invoke-RestMethod -Uri $Endpoint `
+                        -Method POST `
+                        -Headers @{
+                            "Authorization" = "Bearer $Token"
+                            "Content-Type" = "application/json"
+                        } `
+                        -Body $body `
+                        -TimeoutSec 120
+
+                    $parsed = Get-AIResponseText -Response $response
+                    $result.success = $true
+                    $result.response = $parsed
+                    $result.raw = $response
+                } catch {
+                    $result.response = "SRE Agent API and AI fallback both failed: $_"
+                }
+            }
+
+            return $result
+        }
+
+        function Get-SRESystemPrompt {
+            param([string]$Action)
+
+            $prompts = @{
+                "diagnostics" = @"
+You are Azure SRE Agent, an AI-powered reliability assistant. Perform deep diagnostics on the specified Azure resource.
+Analyze: service health, error rates, latency percentiles, resource utilization, dependency health, recent changes.
+Output a structured diagnostic report with severity levels: CRITICAL, HIGH, MEDIUM, LOW, INFO.
+Include root cause analysis and specific remediation steps.
+"@
+                "readiness" = @"
+You are Azure SRE Agent performing a pre-deployment readiness assessment.
+Evaluate: current service health, dependency availability, resource capacity, recent incident history, deployment risk factors.
+Output a GO/NO-GO decision with confidence score (0-100) and specific risk factors.
+If NO-GO, list blocking issues and required remediation.
+"@
+                "audit" = @"
+You are Azure SRE Agent performing a reliability audit.
+Evaluate: SLO compliance, error budgets, resource utilization trends, configuration drift, security posture, backup status, scaling policies.
+Output a structured audit report with findings categorized by reliability pillar (Availability, Performance, Resilience, Observability, Security).
+Include specific recommendations with effort estimates.
+"@
+                "baseline" = @"
+You are Azure SRE Agent managing performance baselines.
+Compare current metrics against established baselines. Identify: anomalies, degradations, improvements, and trend changes.
+Output a baseline comparison report with statistical significance indicators.
+Flag any metrics that deviate more than 2 standard deviations from baseline.
+"@
+                "mitigate" = @"
+You are Azure SRE Agent executing automated mitigation.
+Analyze the incident/issue and recommend specific mitigation actions.
+For each action, specify: the Azure CLI command, expected impact, rollback procedure, and risk level.
+Prioritize actions by impact and safety. Always prefer reversible actions first.
+"@
+            }
+
+            if ($prompts.ContainsKey($Action)) { return $prompts[$Action] }
+            return "You are Azure SRE Agent. Analyze the provided context and give actionable reliability recommendations."
+        }
+
+        function Get-AIResponseText {
+            param($Response)
+            if ($Response.output -and $Response.output[0].content) { return $Response.output[0].content[0].text }
+            if ($Response.choices -and $Response.choices[0].message) { return $Response.choices[0].message.content }
+            if ($Response.text) { return $Response.text }
+            if ($Response.content) { return $Response.content }
+            if ($Response -is [string]) { return $Response }
+            return $null
+        }
+
+        function Get-AzureResourceHealth {
+            param(
+                [string]$ResourceId,
+                [string]$Token
+            )
+            try {
+                $apiVersion = "2023-07-01-preview"
+                $uri = "https://management.azure.com${ResourceId}/providers/Microsoft.ResourceHealth/availabilityStatuses/current?api-version=$apiVersion"
+                $health = Invoke-RestMethod -Uri $uri -Headers @{ "Authorization" = "Bearer $Token" } -TimeoutSec 30
+                return @{
+                    status = $health.properties.availabilityState
+                    summary = $health.properties.summary
+                    reason = $health.properties.reasonType
+                    since = $health.properties.occurredTime
+                }
+            } catch {
+                return @{ status = "Unknown"; summary = "Could not retrieve health: $_"; reason = ""; since = "" }
+            }
+        }
+
+        function Get-AzureMonitorMetrics {
+            param(
+                [string]$ResourceId,
+                [string]$Token,
+                [string]$MetricNames = "Availability,SuccessE2ELatency,Transactions",
+                [string]$Timespan = "PT1H",
+                [string]$Interval = "PT5M"
+            )
+            try {
+                $apiVersion = "2023-10-01"
+                $uri = "https://management.azure.com${ResourceId}/providers/Microsoft.Insights/metrics?api-version=$apiVersion&metricnames=$MetricNames&timespan=$Timespan&interval=$Interval"
+                $metrics = Invoke-RestMethod -Uri $uri -Headers @{ "Authorization" = "Bearer $Token" } -TimeoutSec 30
+                return $metrics
+            } catch {
+                Write-Host "  Could not fetch metrics: $_" -ForegroundColor Yellow
+                return $null
+            }
+        }
+
+        function Get-AzureMonitorAlerts {
+            param(
+                [string]$SubscriptionId,
+                [string]$Token,
+                [string]$Timespan = "1h"
+            )
+            try {
+                $apiVersion = "2023-01-01"
+                $uri = "https://management.azure.com/subscriptions/$SubscriptionId/providers/Microsoft.AlertsManagement/alerts?api-version=$apiVersion&timeRange=$Timespan"
+                $alerts = Invoke-RestMethod -Uri $uri -Headers @{ "Authorization" = "Bearer $Token" } -TimeoutSec 30
+                return $alerts.value
+            } catch {
+                Write-Host "  Could not fetch alerts: $_" -ForegroundColor Yellow
+                return @()
+            }
+        }
+
+        function Get-AzureActivityLog {
+            param(
+                [string]$SubscriptionId,
+                [string]$Token,
+                [int]$HoursBack = 2
+            )
+            try {
+                $startTime = (Get-Date).AddHours(-$HoursBack).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+                $filter = "eventTimestamp ge '$startTime'"
+                $apiVersion = "2015-04-01"
+                $uri = "https://management.azure.com/subscriptions/$SubscriptionId/providers/Microsoft.Insights/eventtypes/management/values?api-version=$apiVersion&`$filter=$filter&`$top=50"
+                $activity = Invoke-RestMethod -Uri $uri -Headers @{ "Authorization" = "Bearer $Token" } -TimeoutSec 30
+                return $activity.value
+            } catch {
+                Write-Host "  Could not fetch activity log: $_" -ForegroundColor Yellow
+                return @()
+            }
+        }
+
+        function Format-SREReport {
+            param(
+                [string]$Title,
+                [string]$Content,
+                [hashtable]$Metadata = @{}
+            )
+
+            $report = @"
+        # $Title
+
+        **Build:** $($env:BUILD_BUILDNUMBER)
+        **Branch:** $($env:BUILD_SOURCEBRANCH)
+        **Pipeline:** $($env:BUILD_DEFINITIONNAME)
+        **Date:** $(Get-Date -Format "yyyy-MM-dd HH:mm:ss UTC")
+        **Requested By:** $($env:BUILD_REQUESTEDFOR)
+
+        $(if ($Metadata.Count -gt 0) {
+            "## Metadata`n" + ($Metadata.GetEnumerator() | ForEach-Object { "| $($_.Key) | $($_.Value) |" } | Out-String)
+        })
+
+        ## Analysis
+
+        $Content
+        "@
+            return $report
+        }
+
+        Write-Host "SRE Agent helper functions loaded." -ForegroundColor Green
+        '@
+
+        Set-Content -Path $helpersPath -Value $helperScript -Force
+        # Strip the 8-space leading indentation inherited from YAML embedding
+        $cleaned = (Get-Content $helpersPath -Raw) -replace '(?m)^        ', ''
+        Set-Content -Path $helpersPath -Value $cleaned -Force
+        Write-Host "##vso[task.setvariable variable=SRE_HELPERS_PATH;isOutput=true]$helpersPath"
+        Write-Host "Helper functions written to: $helpersPath"

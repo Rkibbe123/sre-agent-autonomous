@@ -1,0 +1,323 @@
+# =============================================================================
+# Template: Diagnose Root Cause (Autonomous Pipeline)
+# =============================================================================
+# Clones the target repository (ms-inventory), builds a structural map,
+# identifies relevant source files, and uses Azure OpenAI to correlate the
+# Container App runtime logs with the codebase for root cause analysis.
+# =============================================================================
+
+parameters:
+  - name: azureServiceConnection
+    type: string
+  - name: azureOpenAIEndpoint
+    type: string
+    default: ''
+  - name: azureOpenAIDeployment
+    type: string
+    default: 'agentic-deveops-agent'
+  - name: targetProject
+    type: string
+  - name: targetRepo
+    type: string
+  - name: targetBranch
+    type: string
+  - name: workingDirectory
+    type: string
+  - name: alertSummary
+    type: string
+  - name: errorSignature
+    type: string
+  - name: affectedComponent
+    type: string
+  - name: containerLogs
+    type: string
+    default: ''
+  - name: sreAgentResourceGroup
+    type: string
+    default: ''
+  - name: sreAgentName
+    type: string
+    default: ''
+
+steps:
+  # ── Clone the target repository ────────────────────────────────────────────
+  - task: AzureCLI@2
+    name: CloneRepo
+    displayName: 'Clone target repository'
+    inputs:
+      azureSubscription: '${{ parameters.azureServiceConnection }}'
+      scriptType: pscore
+      scriptLocation: inlineScript
+      inlineScript: |
+        Write-Host "============================================" -ForegroundColor Cyan
+        Write-Host "   SRE AUTONOMOUS AGENT: CLONE REPO         " -ForegroundColor Cyan
+        Write-Host "   Repo:   ${{ parameters.targetRepo }}"     -ForegroundColor Cyan
+        Write-Host "   Branch: ${{ parameters.targetBranch }}"   -ForegroundColor Cyan
+        Write-Host "============================================" -ForegroundColor Cyan
+
+        $orgUrl = "$(System.CollectionUri)".TrimEnd("/")
+        $project = "${{ parameters.targetProject }}"
+        $repoName = "${{ parameters.targetRepo }}"
+        $pat = "$(System.AccessToken)"
+
+        # Build the clone URL using System.AccessToken
+        $encodedPat = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(":$pat"))
+        $cloneUrl = "$orgUrl/$project/_git/$repoName"
+
+        Write-Host "Cloning: $cloneUrl (branch: ${{ parameters.targetBranch }})"
+
+        git -c http.extraHeader="Authorization: Basic $encodedPat" clone `
+          --branch "${{ parameters.targetBranch }}" `
+          --depth 50 `
+          "$cloneUrl" `
+          "${{ parameters.workingDirectory }}"
+
+        if ($LASTEXITCODE -ne 0) {
+          Write-Host "##[error]Failed to clone repository"
+          exit 1
+        }
+
+        Set-Location "${{ parameters.workingDirectory }}"
+        $headSha = git rev-parse --short HEAD
+        Write-Host "HEAD is at $headSha" -ForegroundColor Green
+        Write-Host "##vso[task.setvariable variable=headSha;isOutput=true]$headSha"
+
+  # ── Build repo structure map & gather context ──────────────────────────────
+  - task: PowerShell@2
+    name: MapRepo
+    displayName: 'Map repository structure'
+    inputs:
+      targetType: inline
+      pwsh: true
+      script: |
+        Set-Location "${{ parameters.workingDirectory }}"
+
+        Write-Host "##[group]Repository structure"
+        # List files (exclude noise directories) - cross-platform pwsh approach
+        $excludeDirs = @('.git', 'node_modules', '.venv', 'vendor', '__pycache__', 'bin', 'obj', '.next', 'dist', '.tox')
+        $allFiles = Get-ChildItem -Recurse -File -Depth 4 -ErrorAction SilentlyContinue |
+          Where-Object {
+            $path = $_.FullName
+            -not ($excludeDirs | Where-Object { $path -match [regex]::Escape($_) })
+          } |
+          ForEach-Object { $_.FullName.Replace("${{ parameters.workingDirectory }}", ".").Replace("\", "/") } |
+          Sort-Object |
+          Select-Object -First 500
+
+        $repoStructure = $allFiles -join "`n"
+        $repoStructure | Write-Host
+        Write-Host "##[endgroup]"
+
+        # Save to artifact staging
+        $repoStructure | Out-File -FilePath "$(Build.ArtifactStagingDirectory)/repo_structure.txt" -Encoding utf8
+
+        Write-Host ""
+        Write-Host "##[group]Recent git history (last 20 commits)"
+        $recentCommits = git log --oneline -20 --format="%h %s" 2>$null
+        $recentCommits | Write-Host
+        Write-Host "##[endgroup]"
+        ($recentCommits -join "`n") | Out-File -FilePath "$(Build.ArtifactStagingDirectory)/recent_commits.txt" -Encoding utf8
+
+        Write-Host ""
+        Write-Host "##[group]Files changed in last 10 commits"
+        $recentlyChanged = git diff --name-only HEAD~10..HEAD 2>$null | Sort-Object -Unique
+        if ($recentlyChanged) { $recentlyChanged | Write-Host }
+        else { Write-Host "(fewer than 10 commits)" }
+        Write-Host "##[endgroup]"
+
+        # Set output for the context size
+        Write-Host "##vso[task.setvariable variable=repoFileCount;isOutput=true]$($allFiles.Count)"
+        Write-Host "##vso[task.setvariable variable=recentCommitCount;isOutput=true]$(($recentCommits | Measure-Object).Count)"
+
+  # ── AI-powered root cause analysis via SRE Agent ───────────────────────────
+  - task: AzureCLI@2
+    name: DiagnoseCode
+    displayName: 'SRE Agent: Analyze code & determine root cause'
+    inputs:
+      azureSubscription: '${{ parameters.azureServiceConnection }}'
+      scriptType: pscore
+      scriptLocation: inlineScript
+      inlineScript: |
+        Write-Host "============================================" -ForegroundColor Cyan
+        Write-Host "   SRE AGENT: ROOT CAUSE ANALYSIS           " -ForegroundColor Cyan
+        Write-Host "============================================" -ForegroundColor Cyan
+        Write-Host ""
+
+        $helpersPath = "$(Agent.TempDirectory)/sre-agent-helpers.ps1"
+        if (Test-Path $helpersPath) { . $helpersPath }
+
+        $aiToken = az account get-access-token --resource https://cognitiveservices.azure.com --query accessToken -o tsv
+        $subscriptionId = az account show --query id -o tsv
+
+        Set-Location "${{ parameters.workingDirectory }}"
+
+        $alertSummary      = "${{ parameters.alertSummary }}"
+        $errorSignature    = "${{ parameters.errorSignature }}"
+        $affectedComponent = "${{ parameters.affectedComponent }}"
+
+        # ── Search for files related to the error ──
+        Write-Host "Searching for relevant source files..." -ForegroundColor Yellow
+
+        $codeExtensions = @('.py', '.js', '.ts', '.cs', '.java', '.go', '.rb', '.rs',
+                            '.jsx', '.tsx', '.vue', '.swift', '.kt', '.scala',
+                            '.yaml', '.yml', '.json', '.toml', '.tf', '.bicep',
+                            '.dockerfile', '.sh', '.ps1', '.csx')
+
+        $searchTerms = @($affectedComponent, $errorSignature) |
+          Where-Object { $_ -and $_ -ne "Unknown" -and $_ -ne "Unknown error" } |
+          ForEach-Object { $_.ToLower() }
+
+        $relevantFiles = @()
+        $excludeDirs = @('.git', 'node_modules', '.venv', 'vendor', '__pycache__', 'bin', 'obj')
+
+        Get-ChildItem -Recurse -File -ErrorAction SilentlyContinue |
+          Where-Object {
+            $path = $_.FullName
+            $ext = $_.Extension.ToLower()
+            ($codeExtensions -contains $ext) -and
+            -not ($excludeDirs | Where-Object { $path -match [regex]::Escape($_) })
+          } |
+          ForEach-Object {
+            $relPath = $_.FullName.Replace("${{ parameters.workingDirectory }}", ".").Replace("\", "/")
+            $lowerPath = $relPath.ToLower()
+
+            # Check filename match
+            if ($searchTerms | Where-Object { $lowerPath -match [regex]::Escape($_) }) {
+              $relevantFiles += $relPath
+              return
+            }
+
+            # Quick content scan for smaller files (<50KB)
+            if ($_.Length -lt 50000) {
+              $content = Get-Content $_.FullName -Raw -ErrorAction SilentlyContinue
+              if ($content) {
+                $lowerContent = $content.ToLower()
+                if ($searchTerms | Where-Object { $lowerContent -match [regex]::Escape($_) }) {
+                  $relevantFiles += $relPath
+                }
+              }
+            }
+          }
+
+        $relevantFiles = $relevantFiles | Select-Object -First 15
+        Write-Host "Found $($relevantFiles.Count) relevant file(s)"
+        $relevantFiles | ForEach-Object { Write-Host "  - $_" }
+
+        # ── Build code context for the AI ──
+        $repoStructure = Get-Content "$(Build.ArtifactStagingDirectory)/repo_structure.txt" -Raw -ErrorAction SilentlyContinue
+        $recentCommits = Get-Content "$(Build.ArtifactStagingDirectory)/recent_commits.txt" -Raw -ErrorAction SilentlyContinue
+
+        $codeContext = "=== REPOSITORY STRUCTURE ===`n$($repoStructure | Select-Object -First 200)`n`n"
+        $codeContext += "=== RECENT COMMITS ===`n$recentCommits`n`n"
+        $codeContext += "=== RELEVANT SOURCE FILES ===`n"
+
+        $charBudget = 50000
+        $charsUsed = 0
+
+        foreach ($f in $relevantFiles) {
+          $fullPath = Join-Path "${{ parameters.workingDirectory }}" ($f -replace '^\.\/', '')
+          if (Test-Path $fullPath) {
+            $fileContent = Get-Content $fullPath -Raw -ErrorAction SilentlyContinue
+            if ($fileContent.Length -gt 6000) {
+              $fileContent = $fileContent.Substring(0, 6000) + "`n... [truncated]"
+            }
+            $entry = "`n--- $f ---`n$fileContent`n"
+            if (($charsUsed + $entry.Length) -gt $charBudget) { break }
+            $codeContext += $entry
+            $charsUsed += $entry.Length
+          }
+        }
+
+        Write-Host "Context size: $($codeContext.Length) characters"
+
+        # ── Call SRE Agent / AI for root cause analysis ──
+        Write-Host "`nRunning AI root cause analysis..." -ForegroundColor Yellow
+
+        $diagContext = @"
+        ALERT SUMMARY: $alertSummary
+        ERROR SIGNATURE: $errorSignature
+        AFFECTED COMPONENT: $affectedComponent
+
+        === CONTAINER APP RUNTIME LOGS ===
+        ${{ parameters.containerLogs }}
+
+        === CODEBASE CONTEXT ===
+        $codeContext
+
+        INSTRUCTIONS:
+        You are an expert SRE root-cause analysis agent. You have:
+        1. The Container App's actual runtime error logs above
+        2. The source code from the ms-inventory repository
+
+        Correlate the error in the logs with the source code to find the EXACT root
+        cause. Look for stack traces, exception types, and error messages in the logs
+        that map to specific lines/functions in the code.
+
+        Respond in valid JSON with these keys:
+        - rootCauseAnalysis: A detailed explanation of what code is causing the error
+          seen in the Container App logs (2-4 sentences)
+        - affectedFiles: Comma-separated list of file paths that need changes (relative to repo root)
+        - suggestedFix: A concise description of the code changes needed to fix the error
+        - confidence: "high", "medium", or "low"
+        "@
+
+        $sreResult = Invoke-SREAgentAPI `
+          -Action "diagnostics" `
+          -Context $diagContext `
+          -Token $aiToken `
+          -Endpoint "${{ parameters.azureOpenAIEndpoint }}" `
+          -Deployment "${{ parameters.azureOpenAIDeployment }}" `
+          -SubscriptionId $subscriptionId `
+          -SREAgentName "${{ parameters.sreAgentName }}" `
+          -SREAgentResourceGroup "${{ parameters.sreAgentResourceGroup }}"
+
+        # ── Parse and output results ──
+        $rootCause    = "Unable to determine root cause"
+        $affFiles     = ""
+        $suggestedFix = ""
+
+        if ($sreResult.success) {
+          Write-Host "`nSRE Agent response:" -ForegroundColor Cyan
+          Write-Host $sreResult.response
+
+          try {
+            $parsed = $sreResult.response | ConvertFrom-Json -ErrorAction Stop
+            if ($parsed.rootCauseAnalysis) { $rootCause    = $parsed.rootCauseAnalysis }
+            if ($parsed.affectedFiles)     { $affFiles     = $parsed.affectedFiles }
+            if ($parsed.suggestedFix)      { $suggestedFix = $parsed.suggestedFix }
+
+            Write-Host "`nConfidence: $($parsed.confidence)" -ForegroundColor $(
+              switch ($parsed.confidence) { "high" { "Green" } "medium" { "Yellow" } default { "Red" } }
+            )
+          } catch {
+            $rootCause = $sreResult.response.Substring(0, [Math]::Min(500, $sreResult.response.Length))
+          }
+        } else {
+          Write-Host "##[warning]SRE Agent root cause analysis failed"
+        }
+
+        # Sanitize
+        $rootCause    = ($rootCause    -replace '[\r\n]+', ' ').Trim()
+        $affFiles     = ($affFiles     -replace '[\r\n]+', ' ').Trim()
+        $suggestedFix = ($suggestedFix -replace '[\r\n]+', ' ').Trim()
+
+        Write-Host "##vso[task.setvariable variable=rootCauseAnalysis;isOutput=true]$rootCause"
+        Write-Host "##vso[task.setvariable variable=affectedFiles;isOutput=true]$affFiles"
+        Write-Host "##vso[task.setvariable variable=suggestedFix;isOutput=true]$suggestedFix"
+
+        Write-Host ""
+        Write-Host "ROOT CAUSE ANALYSIS:" -ForegroundColor Green
+        Write-Host "  Cause:    $rootCause"
+        Write-Host "  Files:    $affFiles"
+        Write-Host "  Fix:      $suggestedFix"
+
+        # Save full analysis artifact
+        $sreResult.response | Out-File -FilePath "$(Build.ArtifactStagingDirectory)/root_cause_analysis.txt" -Encoding utf8
+
+  # ── Publish diagnosis artifacts ────────────────────────────────────────────
+  - task: PublishPipelineArtifact@1
+    displayName: 'Publish diagnosis artifacts'
+    inputs:
+      targetPath: '$(Build.ArtifactStagingDirectory)'
+      artifact: 'diagnosis'
+      publishLocation: 'pipeline'

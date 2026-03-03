@@ -1,0 +1,263 @@
+# =============================================================================
+# SRE AUTONOMOUS AGENT PIPELINE
+# =============================================================================
+# Triggered by webhook from a Container App alert/error. The pipeline:
+#   1. Log Review  - SRE Agent queries Container App logs from Log Analytics
+#   2. Diagnose    - Clone ms-inventory repo, AI root cause analysis w/ logs
+#   3. Fix         - Azure OpenAI generates code fix, validates, pushes branch
+#   4. PR          - Create Pull Request with logs, analysis & code changes
+#
+# This pipeline reuses the shared SRE Agent patterns from sre-agent (common
+# helpers, Invoke-SREAgentAPI, AzureCLI@2 + pscore).
+# =============================================================================
+
+trigger: none   # Only triggered via webhook / API
+pr: none        # Not triggered by PRs
+
+# ── Incoming Webhook Trigger ──
+# Azure Monitor Action Group sends alert → Azure DevOps Incoming Webhook →
+# Pipeline auto-triggers. The Common Alert Schema payload is accessible via
+# ${{ parameters.ContainerAppAlert.<path> }} at compile time.
+# See setup/create-webhook-trigger.ps1 to configure the service connection
+# and Action Group.
+resources:
+  webhooks:
+    - webhook: ContainerAppAlert
+      connection: SREAlertWebhookConnection
+
+parameters:
+  # ── Alert / incident context ──
+  - name: alertPayload
+    displayName: 'Alert Payload (JSON)'
+    type: string
+    default: '{}'
+  - name: targetProject
+    displayName: 'Target Azure DevOps Project'
+    type: string
+    default: 'DevSecOps SRE Community Sandbox'
+  - name: targetRepo
+    displayName: 'Target Repository Name (Azure DevOps)'
+    type: string
+    default: 'ms-inventory'
+  - name: targetBranch
+    displayName: 'Target Branch'
+    type: string
+    default: 'main'
+  - name: serviceName
+    displayName: 'Service / Application Name'
+    type: string
+    default: ''
+  - name: severity
+    displayName: 'Alert Severity'
+    type: string
+    default: 'high'
+    values:
+      - critical
+      - high
+      - medium
+      - low
+  - name: incidentId
+    displayName: 'Incident / Alert ID'
+    type: string
+    default: ''
+
+  # ── Container App settings ──
+  - name: containerAppName
+    displayName: 'Container App Name'
+    type: string
+    default: 'azure-resource-inventory'
+  - name: containerAppResourceGroup
+    displayName: 'Container App Resource Group'
+    type: string
+    default: 'rg-rkibbe-2470'
+  - name: logAnalyticsWorkspace
+    displayName: 'Log Analytics Workspace ID'
+    type: string
+    default: ''
+  - name: logTimespan
+    displayName: 'Log Query Timespan'
+    type: string
+    default: 'PT1H'
+
+  # ── SRE Agent settings ──
+  - name: sre_agent_resource_group
+    displayName: 'SRE Agent Resource Group'
+    type: string
+    default: 'rg-rkibbe-2470'
+  - name: sre_agent_name
+    displayName: 'SRE Agent Instance Name'
+    type: string
+    default: 'rkibbe'
+  - name: sre_agent_endpoint
+    displayName: 'SRE Agent Endpoint URL'
+    type: string
+    default: 'https://rkibbe--88208374.4650bed8.eastus2.azuresre.ai'
+
+variables:
+  - group: databricks-dab-pipeline
+  - name: azureOpenAIEndpoint
+    value: 'https://rkibbe-chat-demo-resource.openai.azure.com/openai/v1/chat/completions'
+  - name: azureOpenAIDeployment
+    value: 'agentic-deveops-agent'
+  - name: workingDirectory
+    value: '$(Pipeline.Workspace)/target-repo'
+  - name: fixBranch
+    value: 'sre-agent/fix-$(Build.BuildId)'
+  - name: SYSTEM_ENABLEACCESSTOKEN
+    value: 'true'
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+stages:
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Stage 1 — LOG REVIEW: SRE Agent pulls & analyzes Container App logs
+  # ═══════════════════════════════════════════════════════════════════════════
+  - stage: Detect
+    displayName: '🔍 Review Container App Logs'
+    jobs:
+      - job: DetectFailure
+        displayName: 'Validate & Enrich Alert'
+        steps:
+          - template: templates/sre-agent-common.yml
+            parameters:
+              azureServiceConnection: 'azure-devops-sp2'
+              azureOpenAIEndpoint: '$(azureOpenAIEndpoint)'
+              azureOpenAIDeployment: '$(azureOpenAIDeployment)'
+              sreAgentResourceGroup: '${{ parameters.sre_agent_resource_group }}'
+              sreAgentName: '${{ parameters.sre_agent_name }}'
+
+          - template: templates/detect-failure.yml
+            parameters:
+              azureServiceConnection: 'azure-devops-sp2'
+              azureOpenAIEndpoint: '$(azureOpenAIEndpoint)'
+              azureOpenAIDeployment: '$(azureOpenAIDeployment)'
+              alertPayload: ${{ parameters.alertPayload }}
+              serviceName: ${{ parameters.serviceName }}
+              severity: ${{ parameters.severity }}
+              incidentId: ${{ parameters.incidentId }}
+              containerAppName: ${{ parameters.containerAppName }}
+              containerAppResourceGroup: ${{ parameters.containerAppResourceGroup }}
+              logAnalyticsWorkspace: ${{ parameters.logAnalyticsWorkspace }}
+              logTimespan: ${{ parameters.logTimespan }}
+              sreAgentResourceGroup: '${{ parameters.sre_agent_resource_group }}'
+              sreAgentName: '${{ parameters.sre_agent_name }}'
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Stage 2 — DIAGNOSE: Clone ms-inventory, correlate logs with code
+  # ═══════════════════════════════════════════════════════════════════════════
+  - stage: Diagnose
+    displayName: '🔬 Diagnose Root Cause'
+    dependsOn: Detect
+    condition: succeeded()
+    variables:
+      alertSummary: $[stageDependencies.Detect.DetectFailure.outputs['DetectAlert.alertSummary']]
+      errorSignature: $[stageDependencies.Detect.DetectFailure.outputs['DetectAlert.errorSignature']]
+      affectedComponent: $[stageDependencies.Detect.DetectFailure.outputs['DetectAlert.affectedComponent']]
+      containerLogs: $[stageDependencies.Detect.DetectFailure.outputs['DetectAlert.containerLogs']]
+    jobs:
+      - job: DiagnoseRootCause
+        displayName: 'Analyze Repo & Find Root Cause'
+        steps:
+          - template: templates/sre-agent-common.yml
+            parameters:
+              azureServiceConnection: 'azure-devops-sp2'
+              azureOpenAIEndpoint: '$(azureOpenAIEndpoint)'
+              azureOpenAIDeployment: '$(azureOpenAIDeployment)'
+              sreAgentResourceGroup: '${{ parameters.sre_agent_resource_group }}'
+              sreAgentName: '${{ parameters.sre_agent_name }}'
+
+          - template: templates/diagnose-root-cause.yml
+            parameters:
+              azureServiceConnection: 'azure-devops-sp2'
+              azureOpenAIEndpoint: '$(azureOpenAIEndpoint)'
+              azureOpenAIDeployment: '$(azureOpenAIDeployment)'
+              targetProject: ${{ parameters.targetProject }}
+              targetRepo: ${{ parameters.targetRepo }}
+              targetBranch: ${{ parameters.targetBranch }}
+              workingDirectory: $(workingDirectory)
+              alertSummary: $(alertSummary)
+              errorSignature: $(errorSignature)
+              affectedComponent: $(affectedComponent)
+              containerLogs: $(containerLogs)
+              sreAgentResourceGroup: '${{ parameters.sre_agent_resource_group }}'
+              sreAgentName: '${{ parameters.sre_agent_name }}'
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Stage 3 — FIX: Azure OpenAI generates code fix from logs + code
+  # ═══════════════════════════════════════════════════════════════════════════
+  - stage: Fix
+    displayName: '🛠️ Propose Fix'
+    dependsOn: Diagnose
+    condition: succeeded()
+    variables:
+      rootCauseAnalysis: $[stageDependencies.Diagnose.DiagnoseRootCause.outputs['DiagnoseCode.rootCauseAnalysis']]
+      affectedFiles: $[stageDependencies.Diagnose.DiagnoseRootCause.outputs['DiagnoseCode.affectedFiles']]
+      suggestedFix: $[stageDependencies.Diagnose.DiagnoseRootCause.outputs['DiagnoseCode.suggestedFix']]
+    jobs:
+      - job: ProposeFix
+        displayName: 'Generate & Validate Fix'
+        steps:
+          - template: templates/sre-agent-common.yml
+            parameters:
+              azureServiceConnection: 'azure-devops-sp2'
+              azureOpenAIEndpoint: '$(azureOpenAIEndpoint)'
+              azureOpenAIDeployment: '$(azureOpenAIDeployment)'
+              sreAgentResourceGroup: '${{ parameters.sre_agent_resource_group }}'
+              sreAgentName: '${{ parameters.sre_agent_name }}'
+
+          - template: templates/propose-fix.yml
+            parameters:
+              azureServiceConnection: 'azure-devops-sp2'
+              azureOpenAIEndpoint: '$(azureOpenAIEndpoint)'
+              azureOpenAIDeployment: '$(azureOpenAIDeployment)'
+              targetProject: ${{ parameters.targetProject }}
+              targetRepo: ${{ parameters.targetRepo }}
+              targetBranch: ${{ parameters.targetBranch }}
+              fixBranch: $(fixBranch)
+              workingDirectory: $(workingDirectory)
+              rootCauseAnalysis: $(rootCauseAnalysis)
+              affectedFiles: $(affectedFiles)
+              suggestedFix: $(suggestedFix)
+              sreAgentResourceGroup: '${{ parameters.sre_agent_resource_group }}'
+              sreAgentName: '${{ parameters.sre_agent_name }}'
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Stage 4 — PR: Create Pull Request in ms-inventory with full analysis
+  # ═══════════════════════════════════════════════════════════════════════════
+  - stage: PullRequest
+    displayName: '📋 Create Pull Request'
+    dependsOn: Fix
+    condition: succeeded()
+    variables:
+      fixSummary: $[stageDependencies.Fix.ProposeFix.outputs['GenerateFix.fixSummary']]
+      changedFiles: $[stageDependencies.Fix.ProposeFix.outputs['GenerateFix.changedFiles']]
+      testResults: $[stageDependencies.Fix.ProposeFix.outputs['ValidateFix.testResults']]
+    jobs:
+      - job: CreatePR
+        displayName: 'Create Pull Request'
+        steps:
+          - template: templates/sre-agent-common.yml
+            parameters:
+              azureServiceConnection: 'azure-devops-sp2'
+              azureOpenAIEndpoint: '$(azureOpenAIEndpoint)'
+              azureOpenAIDeployment: '$(azureOpenAIDeployment)'
+              sreAgentResourceGroup: '${{ parameters.sre_agent_resource_group }}'
+              sreAgentName: '${{ parameters.sre_agent_name }}'
+
+          - template: templates/create-pull-request.yml
+            parameters:
+              azureServiceConnection: 'azure-devops-sp2'
+              azureOpenAIEndpoint: '$(azureOpenAIEndpoint)'
+              azureOpenAIDeployment: '$(azureOpenAIDeployment)'
+              targetProject: ${{ parameters.targetProject }}
+              targetRepo: ${{ parameters.targetRepo }}
+              targetBranch: ${{ parameters.targetBranch }}
+              fixBranch: $(fixBranch)
+              workingDirectory: $(workingDirectory)
+              serviceName: ${{ parameters.serviceName }}
+              incidentId: ${{ parameters.incidentId }}
+              severity: ${{ parameters.severity }}
+              fixSummary: $(fixSummary)
+              changedFiles: $(changedFiles)
+              testResults: $(testResults)
