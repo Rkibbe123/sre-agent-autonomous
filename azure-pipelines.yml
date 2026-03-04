@@ -23,7 +23,12 @@ pr: none        # Not triggered by PRs
 resources:
   webhooks:
     - webhook: ContainerAppAlert
-      connection: SREAlertWebhookConnection
+      connection: SREAlertWebhookConnection738
+  repositories:
+    - repository: targetAppRepo
+      type: git
+      name: DevSecOps SRE Community Sandbox/ai-app-svcs
+      ref: refs/heads/main
 
 parameters:
   # ── Alert / incident context ──
@@ -38,7 +43,7 @@ parameters:
   - name: targetRepo
     displayName: 'Target Repository Name (Azure DevOps)'
     type: string
-    default: 'ms-inventory'
+    default: 'ai-app-svcs'
   - name: targetBranch
     displayName: 'Target Branch'
     type: string
@@ -46,7 +51,7 @@ parameters:
   - name: serviceName
     displayName: 'Service / Application Name'
     type: string
-    default: ''
+    default: 'dev-ai-app-svcs-web'
   - name: severity
     displayName: 'Alert Severity'
     type: string
@@ -59,7 +64,7 @@ parameters:
   - name: incidentId
     displayName: 'Incident / Alert ID'
     type: string
-    default: ''
+    default: 'AUTO'
 
   # ── Container App settings ──
   - name: containerAppName
@@ -73,7 +78,7 @@ parameters:
   - name: logAnalyticsWorkspace
     displayName: 'Log Analytics Workspace ID'
     type: string
-    default: ''
+    default: '2898ab68-ba5c-4175-a5a2-437b4f7b97f0'
   - name: logTimespan
     displayName: 'Log Query Timespan'
     type: string
@@ -149,16 +154,23 @@ stages:
   - stage: Diagnose
     displayName: '🔬 Diagnose Root Cause'
     dependsOn: Detect
-    condition: succeeded()
+    condition: and(succeeded(), eq(dependencies.Detect.outputs['DetectFailure.GateFalseAlarm.proceedWithAnalysis'], 'true'))
     variables:
       alertSummary: $[stageDependencies.Detect.DetectFailure.outputs['DetectAlert.alertSummary']]
       errorSignature: $[stageDependencies.Detect.DetectFailure.outputs['DetectAlert.errorSignature']]
       affectedComponent: $[stageDependencies.Detect.DetectFailure.outputs['DetectAlert.affectedComponent']]
+      healthAssessmentSummary: $[stageDependencies.Detect.DetectFailure.outputs['DetectAlert.healthAssessmentSummary']]
+      healthKeyFindings: $[stageDependencies.Detect.DetectFailure.outputs['DetectAlert.healthKeyFindings']]
       containerLogs: $[stageDependencies.Detect.DetectFailure.outputs['DetectAlert.containerLogs']]
     jobs:
       - job: DiagnoseRootCause
         displayName: 'Analyze Repo & Find Root Cause'
         steps:
+          - checkout: self
+          - checkout: targetAppRepo
+            path: target-repo
+            persistCredentials: 'true'
+
           - template: templates/sre-agent-common.yml
             parameters:
               azureServiceConnection: 'azure-devops-sp2'
@@ -179,6 +191,8 @@ stages:
               alertSummary: $(alertSummary)
               errorSignature: $(errorSignature)
               affectedComponent: $(affectedComponent)
+              healthAssessmentSummary: $(healthAssessmentSummary)
+              healthKeyFindings: $(healthKeyFindings)
               containerLogs: $(containerLogs)
               sreAgentResourceGroup: '${{ parameters.sre_agent_resource_group }}'
               sreAgentName: '${{ parameters.sre_agent_name }}'
@@ -189,7 +203,7 @@ stages:
   - stage: Fix
     displayName: '🛠️ Propose Fix'
     dependsOn: Diagnose
-    condition: succeeded()
+    condition: and(succeeded(), eq(dependencies.Detect.outputs['DetectFailure.GateFalseAlarm.proceedWithAnalysis'], 'true'))
     variables:
       rootCauseAnalysis: $[stageDependencies.Diagnose.DiagnoseRootCause.outputs['DiagnoseCode.rootCauseAnalysis']]
       affectedFiles: $[stageDependencies.Diagnose.DiagnoseRootCause.outputs['DiagnoseCode.affectedFiles']]
@@ -198,6 +212,11 @@ stages:
       - job: ProposeFix
         displayName: 'Generate & Validate Fix'
         steps:
+          - checkout: self
+          - checkout: targetAppRepo
+            path: target-repo
+            persistCredentials: 'true'
+
           - template: templates/sre-agent-common.yml
             parameters:
               azureServiceConnection: 'azure-devops-sp2'
@@ -228,7 +247,7 @@ stages:
   - stage: PullRequest
     displayName: '📋 Create Pull Request'
     dependsOn: Fix
-    condition: succeeded()
+    condition: and(succeeded(), eq(dependencies.Detect.outputs['DetectFailure.GateFalseAlarm.proceedWithAnalysis'], 'true'))
     variables:
       fixSummary: $[stageDependencies.Fix.ProposeFix.outputs['GenerateFix.fixSummary']]
       changedFiles: $[stageDependencies.Fix.ProposeFix.outputs['GenerateFix.changedFiles']]

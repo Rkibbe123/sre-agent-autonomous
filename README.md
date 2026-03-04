@@ -1,6 +1,6 @@
 # SRE Autonomous Agent Pipeline
 
-An Azure DevOps pipeline that automatically **reviews Container App logs**, **diagnoses root causes**, **generates code fixes**, and **creates Pull Requests** in the [`ms-inventory`](https://dev.azure.com/3Cloud/DevSecOps%20SRE%20Community%20Sandbox/_git/ms-inventory) repo — triggered by webhook alerts from your Container App.
+An Azure DevOps pipeline that automatically **reviews Container App logs**, **diagnoses root causes**, **generates code fixes**, and **creates Pull Requests** in the [`ai-app-svcs`](https://dev.azure.com/3Cloud/DevSecOps%20SRE%20Community%20Sandbox/_git/ai-app-svcs) repo — triggered by webhook alerts from your Container App.
 
 Built on the same **Azure SRE Agent** + **Azure OpenAI** patterns used in `sre-agent`, with `AzureCLI@2` + PowerShell Core + `Invoke-SREAgentAPI` for all AI interactions.
 
@@ -14,13 +14,13 @@ Container App Error ──► Webhook ──► Azure DevOps Pipeline
                                          │     from Log Analytics (KQL), analyzes errors
                                          │
                                          ├─ 🔬 Stage 2: Diagnose Root Cause
-                                         │     Clone ms-inventory, correlate logs w/ code
+                                         │     Clone ai-app-svcs, correlate logs w/ code
                                          │
                                          ├─ 🛠️ Stage 3: Generate Code Fix
                                          │     Azure OpenAI writes fix, validates, pushes
                                          │
                                          └─ 📋 Stage 4: Create Pull Request
-                                               PR in ms-inventory with logs + analysis
+                                               PR in ai-app-svcs with logs + analysis
 ```
 
 ## Repository Structure
@@ -32,7 +32,7 @@ Container App Error ──► Webhook ──► Azure DevOps Pipeline
 │   ├── detect-failure.yml           # Stage 1: Container App log query & analysis
 │   ├── diagnose-root-cause.yml      # Stage 2: Log-to-code correlation & diagnosis
 │   ├── propose-fix.yml              # Stage 3: AI code fix generation & validation
-│   └── create-pull-request.yml      # Stage 4: PR creation in ms-inventory
+│   └── create-pull-request.yml      # Stage 4: PR creation in ai-app-svcs
 └── README.md
 ```
 
@@ -52,12 +52,12 @@ Container App Error ──► Webhook ──► Azure DevOps Pipeline
 - Service connection: `azure-devops-sp2` (with Contributor + SRE Agent Operator role)
 - Variable group: `databricks-dab-pipeline` linked to the pipeline
 - `System.AccessToken` used for repo clone + PR creation (no separate PAT required)
-- Pipeline permissions: **Code** Read/Write, **Pull Requests** Read/Write on `ms-inventory`
+- Pipeline permissions: **Code** Read/Write, **Pull Requests** Read/Write on `ai-app-svcs`
 
 ### Container App
 - Container App: `azure-resource-inventory` in resource group `rg-rkibbe-2470`
 - Log Analytics workspace connected via the Container App Environment
-- The pipeline auto-discovers the workspace, or you can pass `logAnalyticsWorkspace` explicitly
+- The pipeline defaults to workspace `2898ab68-ba5c-4175-a5a2-437b4f7b97f0` for this repo
 
 ## Setup
 
@@ -83,7 +83,7 @@ Run the setup script to add the webhook to your existing action group and verify
 ```
 
 This does:
-1. **Creates Incoming Webhook Service Connection** (`SREAlertWebhookConnection`) in Azure DevOps
+1. **Creates Incoming Webhook Service Connection** (`SREAlertWebhookConnection738`) in Azure DevOps
 2. **Adds webhook action** to existing Action Group `az-resource-action-grp`
 3. **Verifies** the following alert rules are connected to the action group:
    - `dev-ai-5xx-high`
@@ -93,7 +93,7 @@ This does:
 
 **Flow:**
 ```
-Alert Rule (any of 4) → az-resource-action-grp → Incoming Webhook → Pipeline #731
+Alert Rule (any of 4) → az-resource-action-grp → Incoming Webhook → Pipeline #738
 ```
 
 **Webhook URL:**
@@ -105,13 +105,13 @@ The pipeline auto-maps Azure Monitor's Common Alert Schema severity (`Sev0`–`S
 
 **Manual Fallback:** You can still trigger the pipeline manually via the REST API:
 ```
-POST https://dev.azure.com/3Cloud/DevSecOps%20SRE%20Community%20Sandbox/_apis/pipelines/731/runs?api-version=7.1
+POST https://dev.azure.com/3Cloud/DevSecOps%20SRE%20Community%20Sandbox/_apis/pipelines/738/runs?api-version=7.1
 ```
 
 ```json
 {
   "templateParameters": {
-    "serviceName": "azure-resource-inventory",
+    "serviceName": "dev-ai-app-svcs-web",
     "severity": "high",
     "incidentId": "INC-12345",
     "containerAppName": "azure-resource-inventory",
@@ -120,7 +120,7 @@ POST https://dev.azure.com/3Cloud/DevSecOps%20SRE%20Community%20Sandbox/_apis/pi
 }
 ```
 
-> **Note:** The pipeline auto-discovers the Log Analytics workspace from the Container App, or you can pass `logAnalyticsWorkspace` explicitly.
+> **Note:** This repo defaults `logAnalyticsWorkspace` to `2898ab68-ba5c-4175-a5a2-437b4f7b97f0`.
 
 ### 3. Import Pipeline
 
@@ -137,14 +137,14 @@ POST https://dev.azure.com/3Cloud/DevSecOps%20SRE%20Community%20Sandbox/_apis/pi
 |---|---|---|---|
 | `alertPayload` | Yes | `{}` | JSON alert from your monitoring webhook |
 | `targetProject` | No | `DevSecOps SRE Community Sandbox` | Azure DevOps project containing the target repo |
-| `targetRepo` | Yes | `ms-inventory` | Repository name within your Azure DevOps project |
+| `targetRepo` | Yes | `ai-app-svcs` | Repository name within your Azure DevOps project |
 | `targetBranch` | No | `main` | Branch to base the fix on |
-| `serviceName` | No | — | Name of the affected service |
+| `serviceName` | No | `dev-ai-app-svcs-web` | Name of the affected service |
 | `severity` | No | `high` | Alert severity: critical, high, medium, low |
-| `incidentId` | No | — | Incident/alert tracking ID |
+| `incidentId` | No | `AUTO` | Incident/alert tracking ID |
 | `containerAppName` | No | `azure-resource-inventory` | Azure Container App name |
 | `containerAppResourceGroup` | No | `rg-rkibbe-2470` | Resource group of the Container App |
-| `logAnalyticsWorkspace` | No | (auto-discovered) | Log Analytics workspace ID |
+| `logAnalyticsWorkspace` | No | `2898ab68-ba5c-4175-a5a2-437b4f7b97f0` | Log Analytics workspace ID |
 | `logTimespan` | No | `PT1H` | How far back to query logs (ISO 8601 duration) |
 
 ## How It Works
@@ -152,12 +152,12 @@ POST https://dev.azure.com/3Cloud/DevSecOps%20SRE%20Community%20Sandbox/_apis/pi
 ### Stage 1 — Review Container App Logs
 - Parses the incoming webhook alert payload
 - Queries the Container App's **console logs** (`ContainerAppConsoleLogs_CL`) and **system logs** (`ContainerAppSystemLogs_CL`) from Log Analytics via KQL
-- Auto-discovers the Log Analytics workspace from the Container App Environment
+- Uses the configured Log Analytics workspace ID (`2898ab68-ba5c-4175-a5a2-437b4f7b97f0`)
 - SRE Agent analyzes the combined logs + alert to extract: error signature, affected component, stack trace patterns
 - Gates the pipeline if the issue is not code-actionable (infrastructure/transient)
 
 ### Stage 2 — Diagnose Root Cause
-- Clones the [`ms-inventory`](https://dev.azure.com/3Cloud/DevSecOps%20SRE%20Community%20Sandbox/_git/ms-inventory) repository
+- Clones the [`ai-app-svcs`](https://dev.azure.com/3Cloud/DevSecOps%20SRE%20Community%20Sandbox/_git/ai-app-svcs) repository
 - Maps the repo structure and identifies recently changed files
 - Searches for source files related to the error signature from the logs
 - Azure OpenAI **correlates the Container App runtime logs with the source code** to identify the exact root cause
@@ -167,10 +167,10 @@ POST https://dev.azure.com/3Cloud/DevSecOps%20SRE%20Community%20Sandbox/_apis/pi
 - Creates a fix branch (`sre-agent/fix-{buildId}`)
 - Azure OpenAI generates fixed versions of affected files based on the log-derived root cause
 - Runs language-appropriate validation (Python/Node.js/.NET/Go linting, syntax checks, tests)
-- Commits and pushes the fix branch to `ms-inventory`
+- Commits and pushes the fix branch to `ai-app-svcs`
 
 ### Stage 4 — Create Pull Request
-- Creates a PR in `ms-inventory` via the Azure DevOps REST API
+- Creates a PR in `ai-app-svcs` via the Azure DevOps REST API
 - Rich description includes: Container App logs excerpt, root cause analysis, code changes, and validation results
 - Labels the PR (`sre-agent`, `severity-{level}`, `auto-generated`)
 - Optionally enables auto-complete for low-severity issues

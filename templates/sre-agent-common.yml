@@ -74,6 +74,7 @@ steps:
         if ($LASTEXITCODE -ne 0) {
           Write-Host "##vso[task.logissue type=warning]SRE Agent CLI extension not yet available - falling back to REST API mode"
           Write-Host "##vso[task.setvariable variable=SRE_CLI_AVAILABLE;isOutput=true]false"
+                    $global:LASTEXITCODE = 0
         } else {
           Write-Host "SRE Agent CLI extension installed successfully"
           Write-Host "##vso[task.setvariable variable=SRE_CLI_AVAILABLE;isOutput=true]true"
@@ -81,10 +82,18 @@ steps:
 
         # Get management token for ARM REST API calls
         $mgmtToken = az account get-access-token --resource https://management.azure.com --query accessToken -o tsv
+                if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($mgmtToken)) {
+                    Write-Host "##vso[task.logissue type=error]Failed to acquire ARM management token."
+                    exit 1
+                }
         Write-Host "##vso[task.setvariable variable=SRE_MGMT_TOKEN;isOutput=true;issecret=true]$mgmtToken"
 
         # Get AI token for Azure OpenAI agent calls
         $aiToken = az account get-access-token --resource https://cognitiveservices.azure.com --query accessToken -o tsv
+                if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($aiToken)) {
+                    Write-Host "##vso[task.logissue type=error]Failed to acquire Azure AI token."
+                    exit 1
+                }
         Write-Host "##vso[task.setvariable variable=SRE_AI_TOKEN;isOutput=true;issecret=true]$aiToken"
 
         # Get subscription context
@@ -92,20 +101,26 @@ steps:
         if (-not $subId) {
           $subId = az account show --query id -o tsv
         }
+                if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($subId)) {
+                    Write-Host "##vso[task.logissue type=error]Failed to resolve Azure subscription ID."
+                    exit 1
+                }
         Write-Host "##vso[task.setvariable variable=SRE_SUBSCRIPTION_ID;isOutput=true]$subId"
         Write-Host "Subscription: $subId"
 
-        # Verify Azure Monitor connectivity
+                # Verify Azure Monitor connectivity (non-blocking)
         Write-Host "Verifying Azure Monitor connectivity..."
-        try {
-          $monitorCheck = az monitor metrics list --resource "/subscriptions/$subId" --metric "Availability" --interval PT1H 2>$null
+                $null = az monitor action-group list --subscription $subId --query "length(@)" -o tsv 2>$null
+                if ($LASTEXITCODE -eq 0) {
           Write-Host "Azure Monitor: Connected"
-        } catch {
+                } else {
           Write-Host "##vso[task.logissue type=warning]Azure Monitor connectivity could not be verified"
         }
+                $global:LASTEXITCODE = 0
 
         Write-Host ""
         Write-Host "SRE Agent setup complete." -ForegroundColor Green
+                $global:LASTEXITCODE = 0
 
   # ──────────────────────────────────────────────
   # STEP 2: Create reusable PowerShell helper functions
@@ -134,7 +149,9 @@ steps:
             .PARAMETER Context
                 Additional context string (logs, metrics, etc.)
             .PARAMETER Token
-                Bearer token for authentication
+                Bearer token for Azure SRE Agent ARM API authentication
+            .PARAMETER AIFallbackToken
+                Bearer token for Azure OpenAI fallback authentication
             .PARAMETER Endpoint
                 Azure OpenAI endpoint URL (fallback)
             .PARAMETER Deployment
@@ -145,6 +162,7 @@ steps:
                 [string]$TargetResourceId = "",
                 [string]$Context = "",
                 [Parameter(Mandatory)][string]$Token,
+                [string]$AIFallbackToken = "",
                 [string]$Endpoint = "",
                 [string]$Deployment = "agentic-deveops-agent",
                 [string]$SubscriptionId = "",
@@ -188,6 +206,7 @@ steps:
 
             # Fallback: Use Azure OpenAI with SRE-specific system prompt
             if ($Endpoint) {
+                $openAIToken = if ($AIFallbackToken) { $AIFallbackToken } else { $Token }
                 $sreSystemPrompt = Get-SRESystemPrompt -Action $Action
                 $body = @{
                     model = $Deployment
@@ -203,7 +222,7 @@ steps:
                     $response = Invoke-RestMethod -Uri $Endpoint `
                         -Method POST `
                         -Headers @{
-                            "Authorization" = "Bearer $Token"
+                            "Authorization" = "Bearer $openAIToken"
                             "Content-Type" = "application/json"
                         } `
                         -Body $body `
@@ -226,35 +245,35 @@ steps:
 
             $prompts = @{
                 "diagnostics" = @"
-You are Azure SRE Agent, an AI-powered reliability assistant. Perform deep diagnostics on the specified Azure resource.
-Analyze: service health, error rates, latency percentiles, resource utilization, dependency health, recent changes.
-Output a structured diagnostic report with severity levels: CRITICAL, HIGH, MEDIUM, LOW, INFO.
-Include root cause analysis and specific remediation steps.
-"@
+            You are Azure SRE Agent, an AI-powered reliability assistant. Perform deep diagnostics on the specified Azure resource.
+            Analyze: service health, error rates, latency percentiles, resource utilization, dependency health, recent changes.
+            Output a structured diagnostic report with severity levels: CRITICAL, HIGH, MEDIUM, LOW, INFO.
+            Include root cause analysis and specific remediation steps.
+        "@
                 "readiness" = @"
-You are Azure SRE Agent performing a pre-deployment readiness assessment.
-Evaluate: current service health, dependency availability, resource capacity, recent incident history, deployment risk factors.
-Output a GO/NO-GO decision with confidence score (0-100) and specific risk factors.
-If NO-GO, list blocking issues and required remediation.
-"@
+            You are Azure SRE Agent performing a pre-deployment readiness assessment.
+            Evaluate: current service health, dependency availability, resource capacity, recent incident history, deployment risk factors.
+            Output a GO/NO-GO decision with confidence score (0-100) and specific risk factors.
+            If NO-GO, list blocking issues and required remediation.
+        "@
                 "audit" = @"
-You are Azure SRE Agent performing a reliability audit.
-Evaluate: SLO compliance, error budgets, resource utilization trends, configuration drift, security posture, backup status, scaling policies.
-Output a structured audit report with findings categorized by reliability pillar (Availability, Performance, Resilience, Observability, Security).
-Include specific recommendations with effort estimates.
-"@
+            You are Azure SRE Agent performing a reliability audit.
+            Evaluate: SLO compliance, error budgets, resource utilization trends, configuration drift, security posture, backup status, scaling policies.
+            Output a structured audit report with findings categorized by reliability pillar (Availability, Performance, Resilience, Observability, Security).
+            Include specific recommendations with effort estimates.
+        "@
                 "baseline" = @"
-You are Azure SRE Agent managing performance baselines.
-Compare current metrics against established baselines. Identify: anomalies, degradations, improvements, and trend changes.
-Output a baseline comparison report with statistical significance indicators.
-Flag any metrics that deviate more than 2 standard deviations from baseline.
-"@
+            You are Azure SRE Agent managing performance baselines.
+            Compare current metrics against established baselines. Identify: anomalies, degradations, improvements, and trend changes.
+            Output a baseline comparison report with statistical significance indicators.
+            Flag any metrics that deviate more than 2 standard deviations from baseline.
+        "@
                 "mitigate" = @"
-You are Azure SRE Agent executing automated mitigation.
-Analyze the incident/issue and recommend specific mitigation actions.
-For each action, specify: the Azure CLI command, expected impact, rollback procedure, and risk level.
-Prioritize actions by impact and safety. Always prefer reversible actions first.
-"@
+            You are Azure SRE Agent executing automated mitigation.
+            Analyze the incident/issue and recommend specific mitigation actions.
+            For each action, specify: the Azure CLI command, expected impact, rollback procedure, and risk level.
+            Prioritize actions by impact and safety. Always prefer reversible actions first.
+        "@
             }
 
             if ($prompts.ContainsKey($Action)) { return $prompts[$Action] }

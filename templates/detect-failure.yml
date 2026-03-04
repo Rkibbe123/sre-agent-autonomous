@@ -14,6 +14,7 @@
 #   6. Gate: is the issue code-actionable?
 #
 # Outputs: alertSummary, errorSignature, affectedComponent, isActionable,
+#          healthAssessmentSummary, healthKeyFindings,
 #          containerLogs (raw log excerpt for downstream stages)
 # =============================================================================
 
@@ -42,7 +43,7 @@ parameters:
     default: ''
   - name: logAnalyticsWorkspace
     type: string
-    default: ''
+    default: '2898ab68-ba5c-4175-a5a2-437b4f7b97f0'
   - name: logTimespan
     type: string
     default: 'PT1H'
@@ -270,18 +271,18 @@ steps:
         Write-Host "##vso[task.setvariable variable=consoleLogs;isOutput=true]$($consoleLogs -replace '[\r\n]+', ' ')"
         Write-Host "##vso[task.setvariable variable=systemLogs;isOutput=true]$($systemLogs -replace '[\r\n]+', ' ')"
 
-  # ── Health Check: Is the Container App running normally NOW? ────────────────
+  # ── Health Check: AI-first live service assessment ───────────────────────────
   - task: AzureCLI@2
     name: HealthCheck
-    displayName: 'SRE Agent: Container App Live Health Check'
+    displayName: 'SRE Agent: AI-first Live Health Check'
     inputs:
       azureSubscription: '${{ parameters.azureServiceConnection }}'
       scriptType: pscore
       scriptLocation: inlineScript
       inlineScript: |
         Write-Host "============================================" -ForegroundColor Cyan
-        Write-Host "   SRE AGENT: LIVE HEALTH CHECK              " -ForegroundColor Cyan
-        Write-Host "   Checking if Container App is healthy NOW   " -ForegroundColor Cyan
+        Write-Host "   SRE AGENT: AI-FIRST LIVE HEALTH CHECK     " -ForegroundColor Cyan
+        Write-Host "   Checking service health from live signals  " -ForegroundColor Cyan
         Write-Host "============================================" -ForegroundColor Cyan
         Write-Host ""
 
@@ -290,115 +291,238 @@ steps:
 
         $containerApp = "${{ parameters.containerAppName }}"
         $containerRG  = "${{ parameters.containerAppResourceGroup }}"
+        $serviceName  = "${{ parameters.serviceName }}"
         $subscriptionId = az account show --query id -o tsv
         $mgmtToken = az account get-access-token --resource https://management.azure.com --query accessToken -o tsv
         $aiToken   = az account get-access-token --resource https://cognitiveservices.azure.com --query accessToken -o tsv
 
         $healthSignals = @()
+        $unhealthySignals = @()
         $isHealthyNow  = $true
+        $targetResourceId = ""
+        $targetResourceType = ""
+        $targetResourceName = ""
+        $targetResourceGroup = ""
 
-        # ── 1. Check Container App provisioning & running state ──
-        Write-Host "Checking Container App status..." -ForegroundColor Yellow
-        $caStatus = az containerapp show -n $containerApp -g $containerRG `
-          --query "{state:properties.provisioningState, runState:properties.runningStatus.state, latestRevision:properties.latestRevisionName, trafficWeight:properties.template.revisionSuffix}" `
-          -o json 2>$null | ConvertFrom-Json
-
-        if ($caStatus) {
-          Write-Host "  Provisioning: $($caStatus.state)"
-          Write-Host "  Running:      $($caStatus.runState)"
-          Write-Host "  Revision:     $($caStatus.latestRevision)"
-          $healthSignals += "ProvisioningState: $($caStatus.state), RunningStatus: $($caStatus.runState)"
-
-          if ($caStatus.runState -ne "Running" -or $caStatus.state -ne "Succeeded") {
-            $isHealthyNow = $false
-          }
-        } else {
-          Write-Host "  ##[warning]Could not query Container App status"
-          $healthSignals += "Container App status: UNKNOWN"
-        }
-
-        # ── 2. Check all revision replicas ──
-        Write-Host "Checking revision replicas..." -ForegroundColor Yellow
-        $replicas = az containerapp replica list -n $containerApp -g $containerRG `
-          --query "[].{name:name, running:properties.runningState, ready:properties.readyState, restarts:properties.containers[0].restartCount}" `
-          -o json 2>$null | ConvertFrom-Json
-
-        if ($replicas) {
-          foreach ($r in $replicas) {
-            $state = if ($r.running) { $r.running } else { "Unknown" }
-            $restarts = if ($r.restarts) { $r.restarts } else { 0 }
-            Write-Host "  Replica: $($r.name) | State: $state | Restarts: $restarts"
-            if ($state -ne "Running" -or $restarts -gt 3) {
-              $isHealthyNow = $false
+        # ── 1. Resolve best target resource (prefer App Service by serviceName) ──
+        $webAppResource = $null
+        if ($serviceName) {
+          Write-Host "Resolving App Service resource '$serviceName'..." -ForegroundColor Yellow
+          $webAppResourceJson = az resource list --name $serviceName --resource-type Microsoft.Web/sites --query "[0].{id:id,name:name,resourceGroup:resourceGroup}" -o json 2>$null
+          if ($LASTEXITCODE -eq 0 -and $webAppResourceJson -and $webAppResourceJson -ne "null") {
+            try {
+              $webAppResource = $webAppResourceJson | ConvertFrom-Json
+            } catch {
+              $webAppResource = $null
             }
           }
-          $healthSignals += "Replicas: $($replicas.Count) total"
-        } else {
-          Write-Host "  Could not enumerate replicas (may require latest revision name)"
+          $global:LASTEXITCODE = 0
         }
 
-        # ── 3. Check recent ingress (last 5 min of request success/errors) ──
-        Write-Host "Checking recent ingress traffic..." -ForegroundColor Yellow
-        $resourceId = "/subscriptions/$subscriptionId/resourceGroups/$containerRG/providers/Microsoft.App/containerApps/$containerApp"
+        if ($webAppResource -and $webAppResource.id) {
+          $targetResourceId = $webAppResource.id
+          $targetResourceType = "Microsoft.Web/sites"
+          $targetResourceName = $webAppResource.name
+          $targetResourceGroup = $webAppResource.resourceGroup
+          Write-Host "Using App Service as health target: $targetResourceName ($targetResourceGroup)" -ForegroundColor Green
+        } else {
+          $targetResourceId = "/subscriptions/$subscriptionId/resourceGroups/$containerRG/providers/Microsoft.App/containerApps/$containerApp"
+          $targetResourceType = "Microsoft.App/containerApps"
+          $targetResourceName = $containerApp
+          $targetResourceGroup = $containerRG
+          Write-Host "App Service '$serviceName' not found. Falling back to Container App '$containerApp'." -ForegroundColor Yellow
+        }
+
+        # ── 2. Collect runtime signals for resolved target resource ──
+        if ($targetResourceType -eq "Microsoft.Web/sites") {
+          Write-Host "Checking App Service runtime status..." -ForegroundColor Yellow
+          $webApp = az webapp show -n $targetResourceName -g $targetResourceGroup -o json 2>$null | ConvertFrom-Json
+
+          if ($webApp) {
+            $webAppState = $webApp.state
+            $linuxFxVersion = if ($webApp.siteConfig) { $webApp.siteConfig.linuxFxVersion } else { "" }
+            $lastModified = $webApp.lastModifiedTimeUtc
+
+            Write-Host "  State:        $webAppState"
+            Write-Host "  Runtime:      $linuxFxVersion"
+            Write-Host "  Last Modified:$lastModified"
+
+            $healthSignals += "AppServiceState: $webAppState"
+            $healthSignals += "Runtime: $linuxFxVersion"
+
+            if ($webAppState -and $webAppState -notin @("Running", "Started")) {
+              $isHealthyNow = $false
+              $unhealthySignals += "App Service state is '$webAppState'"
+            }
+          } else {
+            Write-Host "  ##[warning]Could not query App Service status"
+            $healthSignals += "App Service status: UNKNOWN"
+          }
+
+          Write-Host "Checking App Service diagnostic settings..." -ForegroundColor Yellow
+          $diagJson = az monitor diagnostic-settings list --resource $targetResourceId -o json 2>$null
+          if ($LASTEXITCODE -eq 0 -and $diagJson) {
+            try {
+              $diagObj = $diagJson | ConvertFrom-Json
+              $diagCount = if ($diagObj.value) { $diagObj.value.Count } else { 0 }
+              Write-Host "  Diagnostic settings found: $diagCount"
+              $healthSignals += "DiagnosticSettingsCount: $diagCount"
+            } catch {
+              Write-Host "  ##[warning]Could not parse diagnostic settings response"
+            }
+          } else {
+            Write-Host "  ##[warning]Could not query diagnostic settings"
+          }
+          $global:LASTEXITCODE = 0
+        } else {
+          Write-Host "Checking Container App status..." -ForegroundColor Yellow
+          $caStatus = az containerapp show -n $containerApp -g $containerRG -o json 2>$null | ConvertFrom-Json
+
+          if ($caStatus) {
+            $provisioningState = $caStatus.properties.provisioningState
+            $runningStatusRaw = $caStatus.properties.runningStatus
+            $runningState = if ($runningStatusRaw -is [string]) {
+              $runningStatusRaw
+            } elseif ($runningStatusRaw -and $runningStatusRaw.state) {
+              $runningStatusRaw.state
+            } else {
+              "Unknown"
+            }
+            $latestRevision = $caStatus.properties.latestRevisionName
+
+            Write-Host "  Provisioning: $provisioningState"
+            Write-Host "  Running:      $runningState"
+            Write-Host "  Revision:     $latestRevision"
+            $healthSignals += "ProvisioningState: $provisioningState, RunningStatus: $runningState"
+
+            if ($provisioningState -and $provisioningState -ne "Succeeded") {
+              $isHealthyNow = $false
+              $unhealthySignals += "Provisioning state is '$provisioningState'"
+            }
+
+            if ($runningState -in @("Stopped", "Failed", "Degraded", "Error")) {
+              $isHealthyNow = $false
+              $unhealthySignals += "Running state is '$runningState'"
+            }
+          } else {
+            Write-Host "  ##[warning]Could not query Container App status"
+            $healthSignals += "Container App status: UNKNOWN"
+          }
+
+          Write-Host "Checking revision replicas..." -ForegroundColor Yellow
+          $replicas = az containerapp replica list -n $containerApp -g $containerRG `
+            --query "[].{name:name, running:properties.runningState, ready:properties.readyState, restarts:properties.containers[0].restartCount}" `
+            -o json 2>$null | ConvertFrom-Json
+
+          if ($replicas) {
+            foreach ($r in $replicas) {
+              $state = if ($r.running) { $r.running } else { "Unknown" }
+              $restarts = if ($r.restarts) { $r.restarts } else { 0 }
+              Write-Host "  Replica: $($r.name) | State: $state | Restarts: $restarts"
+              if ($state -in @("Stopped", "Failed", "Degraded", "Error") -or $restarts -gt 10) {
+                $isHealthyNow = $false
+                if ($state -in @("Stopped", "Failed", "Degraded", "Error")) {
+                  $unhealthySignals += "Replica '$($r.name)' state is '$state'"
+                }
+                if ($restarts -gt 10) {
+                  $unhealthySignals += "Replica '$($r.name)' restart count is high ($restarts)"
+                }
+              }
+            }
+            $healthSignals += "Replicas: $($replicas.Count) total"
+          } else {
+            Write-Host "  Could not enumerate replicas (may require latest revision name)"
+          }
+        }
+
+        # ── 3. Check recent platform metrics for target resource ──
+        Write-Host "Checking recent platform metrics..." -ForegroundColor Yellow
+        $metricNames = if ($targetResourceType -eq "Microsoft.Web/sites") {
+          "Requests,Http5xx,AverageResponseTime"
+        } else {
+          "Requests,RestartCount"
+        }
 
         try {
-          $metricsUri = "https://management.azure.com${resourceId}/providers/Microsoft.Insights/metrics?api-version=2023-10-01&metricnames=Requests,RestartCount&timespan=PT5M&interval=PT1M"
+          $metricsUri = "https://management.azure.com${targetResourceId}/providers/Microsoft.Insights/metrics?api-version=2023-10-01&metricnames=$metricNames&timespan=PT10M&interval=PT5M"
           $metrics = Invoke-RestMethod -Uri $metricsUri -Headers @{ "Authorization" = "Bearer $mgmtToken" } -TimeoutSec 20
 
           foreach ($m in $metrics.value) {
             $metricName = $m.name.value
             $latest = $m.timeseries | ForEach-Object { $_.data } | Select-Object -Last 1
-            $val = if ($latest.total) { $latest.total } elseif ($latest.count) { $latest.count } else { "N/A" }
-            Write-Host "  $metricName (last 5 min): $val"
+            $val = if ($latest.total -ne $null) {
+              $latest.total
+            } elseif ($latest.average -ne $null) {
+              [Math]::Round($latest.average, 2)
+            } elseif ($latest.count -ne $null) {
+              $latest.count
+            } else {
+              "N/A"
+            }
+            Write-Host "  $metricName (latest): $val"
             $healthSignals += "$metricName`: $val"
           }
         } catch {
-          Write-Host "  ##[warning]Could not fetch ingress metrics: $_"
+          Write-Host "  ##[warning]Could not fetch platform metrics: $_"
         }
 
         # ── 4. Check Azure Resource Health ──
         Write-Host "Checking Azure Resource Health..." -ForegroundColor Yellow
-        $health = Get-AzureResourceHealth -ResourceId $resourceId -Token $mgmtToken
+        $health = Get-AzureResourceHealth -ResourceId $targetResourceId -Token $mgmtToken
         Write-Host "  Health status: $($health.status)"
         Write-Host "  Summary:       $($health.summary)"
         $healthSignals += "ResourceHealth: $($health.status)"
 
         if ($health.status -eq "Unavailable" -or $health.status -eq "Degraded") {
           $isHealthyNow = $false
+          $unhealthySignals += "Resource health is '$($health.status)'"
         }
 
         # ── 5. SRE Agent: Assess overall health ──
         Write-Host ""
-        Write-Host "Asking SRE Agent to assess current health..." -ForegroundColor Yellow
+        Write-Host "Asking SRE Agent to run a comprehensive health assessment..." -ForegroundColor Yellow
 
         $healthContext = @"
-        CONTAINER APP: $containerApp
-        RESOURCE GROUP: $containerRG
+        TARGET RESOURCE NAME: $targetResourceName
+        TARGET RESOURCE TYPE: $targetResourceType
+        TARGET RESOURCE GROUP: $targetResourceGroup
+        TARGET RESOURCE ID: $targetResourceId
 
-        LIVE HEALTH SIGNALS (queried just now):
+        SERVICE NAME: $serviceName
+
+        LIVE HEALTH SIGNALS (pipeline-collected):
         $($healthSignals -join "`n")
 
         ORIGINAL ALERT SEVERITY: ${{ parameters.severity }}
         ORIGINAL ALERT INCIDENT: ${{ parameters.incidentId }}
 
-        INSTRUCTIONS:
-        You received an alert for this Container App, but before investigating further
-        we need to know if this was a false alarm or transient issue. Based on the LIVE
-        health signals above (NOT the original alert), determine:
+        TASK:
+        Determine whether this service is currently healthy and whether the incoming
+        alert should be treated as a false alarm. Use the live signals above and your
+        own SRE reasoning about runtime state, platform health, and monitoring posture.
 
-        1. currentStatus - "healthy", "degraded", or "unhealthy"
-        2. isFalseAlarm - "true" if the app is running normally now and the alert was
-           likely a transient glitch, network blip, or false positive. "false" if
-           there are still signs of a real problem.
-        3. reason - Brief explanation of your assessment
+        Respond ONLY in valid JSON with exactly these keys:
+        {
+          "currentStatus": "healthy|degraded|unhealthy|unknown",
+          "isFalseAlarm": true,
+          "confidence": 0,
+          "reason": "short explanation",
+          "keyFindings": ["finding 1", "finding 2"],
+          "recommendedNextAction": "skip-diagnose|continue-diagnose"
+        }
 
-        Respond ONLY in valid JSON with exactly these three keys.
+        Rules:
+        - Set isFalseAlarm=true only when currentStatus is healthy and confidence >= 70.
+        - If evidence is incomplete, set currentStatus=unknown and isFalseAlarm=false.
+        - Keep reason short and concrete.
         "@
 
         $sreResult = Invoke-SREAgentAPI `
           -Action "diagnostics" `
+          -TargetResourceId $targetResourceId `
           -Context $healthContext `
-          -Token $aiToken `
+          -Token $mgmtToken `
+          -AIFallbackToken $aiToken `
           -Endpoint "${{ parameters.azureOpenAIEndpoint }}" `
           -Deployment "${{ parameters.azureOpenAIDeployment }}" `
           -SubscriptionId $subscriptionId `
@@ -407,48 +531,154 @@ steps:
 
         $currentStatus = "unknown"
         $isFalseAlarm  = "false"
+        $confidence    = 0
         $reason        = ""
+        $findingsText  = ""
+        $recommendedNextAction = "continue-diagnose"
 
         if ($sreResult.success) {
           try {
             $parsed = $sreResult.response | ConvertFrom-Json -ErrorAction Stop
-            if ($parsed.currentStatus) { $currentStatus = $parsed.currentStatus }
-            if ($parsed.isFalseAlarm)  { $isFalseAlarm  = "$($parsed.isFalseAlarm)".ToLower() }
-            if ($parsed.reason)        { $reason = $parsed.reason }
+            if ($parsed.currentStatus) {
+              $currentStatus = "$($parsed.currentStatus)".ToLower()
+            }
+            if ($null -ne $parsed.isFalseAlarm) {
+              if ($parsed.isFalseAlarm -is [bool]) {
+                $isFalseAlarm = if ($parsed.isFalseAlarm) { "true" } else { "false" }
+              } else {
+                $isFalseAlarm = if ("$($parsed.isFalseAlarm)".ToLower() -eq "true") { "true" } else { "false" }
+              }
+            }
+            if ($null -ne $parsed.confidence) {
+              try {
+                $confidence = [int]$parsed.confidence
+              } catch {
+                $confidence = 0
+              }
+            }
+            if ($parsed.reason) {
+              $reason = "$($parsed.reason)"
+            }
+            if ($parsed.keyFindings) {
+              if ($parsed.keyFindings -is [System.Array]) {
+                $findingsText = ($parsed.keyFindings | ForEach-Object { "$_" }) -join " | "
+              } else {
+                $findingsText = "$($parsed.keyFindings)"
+              }
+            }
+            if ($parsed.recommendedNextAction) {
+              $recommendedNextAction = "$($parsed.recommendedNextAction)"
+            }
+
+            if ($currentStatus -eq "unhealthy") {
+              $isFalseAlarm = "false"
+            }
+
+            if ($isFalseAlarm -eq "true" -and $confidence -lt 70) {
+              $isFalseAlarm = "false"
+              if ($reason) {
+                $reason = "$reason Confidence below threshold ($confidence)."
+              } else {
+                $reason = "Confidence below threshold ($confidence)."
+              }
+              $recommendedNextAction = "continue-diagnose"
+            }
           } catch {
-            $reason = $sreResult.response.Substring(0, [Math]::Min(200, $sreResult.response.Length))
+            $raw = if ($sreResult.response) { "$($sreResult.response)" } else { "" }
+            if ($raw.Length -gt 0) {
+              $reason = $raw.Substring(0, [Math]::Min(220, $raw.Length))
+            }
             # If AI couldn't parse, fall back to our own signals
-            if ($isHealthyNow) { $isFalseAlarm = "true"; $currentStatus = "healthy" }
+            if ($isHealthyNow) {
+              $isFalseAlarm = "true"
+              $currentStatus = "healthy"
+              $recommendedNextAction = "skip-diagnose"
+            }
           }
 
           Write-Host ""
           Write-Host "SRE Agent health assessment:" -ForegroundColor Cyan
           Write-Host $sreResult.response
         } else {
-          # AI unavailable — use our direct signal checks
+          # AI unavailable — use local signal checks
           if ($isHealthyNow) {
             $currentStatus = "healthy"
             $isFalseAlarm = "true"
-            $reason = "All live health checks passed — Container App is running normally."
+            $confidence = 65
+            $reason = "All local live health checks passed — service appears healthy."
+            $recommendedNextAction = "skip-diagnose"
           } else {
             $currentStatus = "unhealthy"
             $isFalseAlarm = "false"
-            $reason = "One or more live health checks failed."
+            $confidence = 85
+            $recommendedNextAction = "continue-diagnose"
+            if ($unhealthySignals.Count -gt 0) {
+              $reason = "Live health checks failed: " + ($unhealthySignals -join "; ")
+            } else {
+              $reason = "One or more live health checks failed."
+            }
           }
         }
 
+        if (-not $reason) {
+          if ($isFalseAlarm -eq "true") {
+            $reason = "Service appears healthy from current live signals."
+          } else {
+            $reason = "Service may still be impacted — continuing analysis."
+          }
+        }
+
+        if (-not $recommendedNextAction) {
+          $recommendedNextAction = if ($isFalseAlarm -eq "true") { "skip-diagnose" } else { "continue-diagnose" }
+        }
+
+        $findingsArray = @()
+        if ($findingsText) {
+          $findingsArray = @(
+            $findingsText -split '\s\|\s' |
+            ForEach-Object { $_.Trim() } |
+            Where-Object { $_ }
+          )
+        }
+
+        $healthAssessmentObj = @{
+          currentStatus = $currentStatus
+          isFalseAlarm = ($isFalseAlarm -eq "true")
+          confidence = $confidence
+          reason = $reason
+          keyFindings = $findingsArray
+          recommendedNextAction = $recommendedNextAction
+          targetResourceName = $targetResourceName
+          targetResourceType = $targetResourceType
+          targetResourceId = $targetResourceId
+        }
+        $healthAssessmentJson = $healthAssessmentObj | ConvertTo-Json -Depth 8 -Compress
+        $healthAssessmentB64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($healthAssessmentJson))
+
         Write-Host ""
         Write-Host "HEALTH CHECK RESULT:" -ForegroundColor $(if ($isFalseAlarm -eq "true") { "Yellow" } else { "Red" })
+        Write-Host "  Target:        $targetResourceName ($targetResourceType)"
         Write-Host "  Current Status: $currentStatus"
         Write-Host "  False Alarm:    $isFalseAlarm"
+        Write-Host "  Confidence:     $confidence"
+        Write-Host "  Next Action:    $recommendedNextAction"
         Write-Host "  Reason:         $reason"
+        if ($findingsText) {
+          Write-Host "  Findings:       $findingsText"
+        }
 
         Write-Host "##vso[task.setvariable variable=currentStatus;isOutput=true]$currentStatus"
         Write-Host "##vso[task.setvariable variable=isFalseAlarm;isOutput=true]$isFalseAlarm"
+        Write-Host "##vso[task.setvariable variable=healthConfidence;isOutput=true]$confidence"
+        Write-Host "##vso[task.setvariable variable=healthFindings;isOutput=true]$($findingsText -replace '[\r\n]+', ' ')"
+        Write-Host "##vso[task.setvariable variable=healthTargetResource;isOutput=true]$($targetResourceName -replace '[\r\n]+', ' ')"
+        Write-Host "##vso[task.setvariable variable=healthNextAction;isOutput=true]$recommendedNextAction"
+        Write-Host "##vso[task.setvariable variable=healthAssessmentB64;isOutput=true]$healthAssessmentB64"
         Write-Host "##vso[task.setvariable variable=healthReason;isOutput=true]$($reason -replace '[\r\n]+', ' ')"
 
   # ── Gate: Abort early if this is a false alarm ─────────────────────────────
   - task: PowerShell@2
+    name: GateFalseAlarm
     displayName: 'Gate: False alarm check'
     inputs:
       targetType: inline
@@ -456,29 +686,40 @@ steps:
       script: |
         $isFalseAlarm = "$(HealthCheck.isFalseAlarm)"
         $status       = "$(HealthCheck.currentStatus)"
+        $confidence   = "$(HealthCheck.healthConfidence)"
+        $findings     = "$(HealthCheck.healthFindings)"
+        $target       = "$(HealthCheck.healthTargetResource)"
         $reason       = "$(HealthCheck.healthReason)"
 
         if ($isFalseAlarm -eq "true") {
           Write-Host "============================================" -ForegroundColor Green
-          Write-Host "   FALSE ALARM — Container App is healthy    " -ForegroundColor Green
+          Write-Host "   FALSE ALARM — Service appears healthy      " -ForegroundColor Green
           Write-Host "============================================" -ForegroundColor Green
           Write-Host ""
+          Write-Host "  Target: $target"
           Write-Host "  Status: $status"
+          Write-Host "  Confidence: $confidence"
           Write-Host "  Reason: $reason"
+          if ($findings) { Write-Host "  Findings: $findings" }
           Write-Host ""
           Write-Host "The alert was likely a transient glitch, network blip, or false positive."
           Write-Host "Skipping root cause analysis and code fix generation."
-          Write-Host "##vso[task.complete result=SucceededWithIssues;]False alarm — $reason"
-          exit 1
+          Write-Host "##vso[task.setvariable variable=proceedWithAnalysis;isOutput=true]false"
+          Write-Host "##vso[task.complete result=Succeeded;]False alarm — $reason"
+          exit 0
         }
 
-        Write-Host "Container App is NOT healthy ($status) — proceeding with log analysis." -ForegroundColor Yellow
+        Write-Host "##vso[task.setvariable variable=proceedWithAnalysis;isOutput=true]true"
+        Write-Host "Service is NOT healthy ($status) — proceeding with log analysis." -ForegroundColor Yellow
+        Write-Host "  Confidence: $confidence"
         Write-Host "  Reason: $reason"
+        if ($findings) { Write-Host "  Findings: $findings" }
 
   # ── SRE Agent: Analyze logs + alert payload ────────────────────────────────
   - task: AzureCLI@2
     name: DetectAlert
     displayName: 'SRE Agent: Analyze Logs & Triage Alert'
+    condition: and(succeeded(), eq(variables['GateFalseAlarm.proceedWithAnalysis'], 'true'))
     inputs:
       azureSubscription: '${{ parameters.azureServiceConnection }}'
       scriptType: pscore
@@ -494,8 +735,44 @@ steps:
           Write-Host "##vso[task.logissue type=warning]SRE helpers not found — ensure sre-agent-common.yml ran first"
         }
 
+        $mgmtToken = az account get-access-token --resource https://management.azure.com --query accessToken -o tsv
         $aiToken = az account get-access-token --resource https://cognitiveservices.azure.com --query accessToken -o tsv
         $subscriptionId = az account show --query id -o tsv
+
+        # ── Bring forward structured health assessment from HealthCheck ──
+        $healthStatus = "$(HealthCheck.currentStatus)"
+        $healthFalseAlarm = "$(HealthCheck.isFalseAlarm)"
+        $healthConfidence = "$(HealthCheck.healthConfidence)"
+        $healthReason = "$(HealthCheck.healthReason)"
+        $healthFindingsFromCheck = "$(HealthCheck.healthFindings)"
+        $healthTarget = "$(HealthCheck.healthTargetResource)"
+        $healthNextAction = "$(HealthCheck.healthNextAction)"
+        $healthAssessmentB64 = "$(HealthCheck.healthAssessmentB64)"
+
+        $healthAssessmentJson = "{}"
+        if ($healthAssessmentB64) {
+          try {
+            $healthAssessmentJson = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($healthAssessmentB64))
+          } catch {
+            Write-Host "##[warning]Failed to decode health assessment payload from HealthCheck"
+          }
+        }
+
+        $healthSummary = "Target=$healthTarget; Status=$healthStatus; FalseAlarm=$healthFalseAlarm; Confidence=$healthConfidence; NextAction=$healthNextAction; Reason=$healthReason"
+        if (-not $healthFindingsFromCheck) {
+          try {
+            $healthObj = $healthAssessmentJson | ConvertFrom-Json -ErrorAction Stop
+            if ($healthObj.keyFindings) {
+              if ($healthObj.keyFindings -is [System.Array]) {
+                $healthFindingsFromCheck = ($healthObj.keyFindings | ForEach-Object { "$_" }) -join " | "
+              } else {
+                $healthFindingsFromCheck = "$($healthObj.keyFindings)"
+              }
+            }
+          } catch {
+            # ignore parse issues; triage prompt can still use the summary string
+          }
+        }
 
         # ── Parse the webhook alert payload ──
         $rawPayload = @'
@@ -531,6 +808,15 @@ steps:
         SEVERITY: ${{ parameters.severity }}
         INCIDENT_ID: ${{ parameters.incidentId }}
 
+        === LIVE HEALTH SUMMARY (FROM HEALTHCHECK) ===
+        $healthSummary
+
+        === LIVE HEALTH FINDINGS (FROM HEALTHCHECK) ===
+        $healthFindingsFromCheck
+
+        === LIVE HEALTH JSON (FROM HEALTHCHECK) ===
+        $healthAssessmentJson
+
         === WEBHOOK ALERT PAYLOAD ===
         $($payloadObj | ConvertTo-Json -Depth 10 -Compress)
 
@@ -548,17 +834,21 @@ steps:
            (look for file references, class names, or function names in stack traces)
         4. isActionable - "true" if the logs show a code-level bug that can be fixed in the
            repository, "false" if it's infrastructure/config/transient
+          5. healthAssessmentSummary - one-line summary reusing the health-check conclusion
+          6. healthKeyFindings - top health findings relevant for downstream diagnosis
 
         Prioritize information from the RUNTIME LOGS over the alert payload when available.
+          Use health data as supporting context to avoid contradicting live health signals.
         Look for stack traces, exception types, and error messages that point to specific code.
 
-        Respond ONLY in valid JSON with exactly these four keys.
+          Respond ONLY in valid JSON with exactly these six keys.
         "@
 
         $sreResult = Invoke-SREAgentAPI `
           -Action "diagnostics" `
           -Context $analysisContext `
-          -Token $aiToken `
+          -Token $mgmtToken `
+          -AIFallbackToken $aiToken `
           -Endpoint "${{ parameters.azureOpenAIEndpoint }}" `
           -Deployment "${{ parameters.azureOpenAIDeployment }}" `
           -SubscriptionId $subscriptionId `
@@ -570,6 +860,8 @@ steps:
         $errorSignature    = "Unknown error"
         $affectedComponent = "${{ parameters.serviceName }}"
         $isActionable      = "true"
+        $healthAssessmentSummary = $healthSummary
+        $healthKeyFindings = $healthFindingsFromCheck
 
         if ($sreResult.success) {
           try {
@@ -578,6 +870,14 @@ steps:
             if ($parsed.errorSignature)     { $errorSignature = $parsed.errorSignature }
             if ($parsed.affectedComponent)  { $affectedComponent = $parsed.affectedComponent }
             if ($parsed.isActionable)       { $isActionable = "$($parsed.isActionable)" }
+            if ($parsed.healthAssessmentSummary) { $healthAssessmentSummary = "$($parsed.healthAssessmentSummary)" }
+            if ($parsed.healthKeyFindings) {
+              if ($parsed.healthKeyFindings -is [System.Array]) {
+                $healthKeyFindings = ($parsed.healthKeyFindings | ForEach-Object { "$_" }) -join " | "
+              } else {
+                $healthKeyFindings = "$($parsed.healthKeyFindings)"
+              }
+            }
           } catch {
             $alertSummary = $sreResult.response.Substring(0, [Math]::Min(200, $sreResult.response.Length))
           }
@@ -601,6 +901,8 @@ steps:
         $alertSummary       = ($alertSummary       -replace '[\r\n]+', ' ').Trim()
         $errorSignature     = ($errorSignature     -replace '[\r\n]+', ' ').Trim()
         $affectedComponent  = ($affectedComponent  -replace '[\r\n]+', ' ').Trim()
+        $healthAssessmentSummary = ($healthAssessmentSummary -replace '[\r\n]+', ' ').Trim()
+        $healthKeyFindings = ($healthKeyFindings -replace '[\r\n]+', ' ').Trim()
 
         # Build a compact log excerpt for passing between stages
         $logExcerptForVar = if ($containerLogs.Length -gt 4000) {
@@ -613,6 +915,8 @@ steps:
         Write-Host "##vso[task.setvariable variable=errorSignature;isOutput=true]$errorSignature"
         Write-Host "##vso[task.setvariable variable=affectedComponent;isOutput=true]$affectedComponent"
         Write-Host "##vso[task.setvariable variable=isActionable;isOutput=true]$isActionable"
+        Write-Host "##vso[task.setvariable variable=healthAssessmentSummary;isOutput=true]$healthAssessmentSummary"
+        Write-Host "##vso[task.setvariable variable=healthKeyFindings;isOutput=true]$healthKeyFindings"
         Write-Host "##vso[task.setvariable variable=containerLogs;isOutput=true]$logExcerptForVar"
 
         Write-Host ""
@@ -621,6 +925,10 @@ steps:
         Write-Host "  Error:      $errorSignature"
         Write-Host "  Component:  $affectedComponent"
         Write-Host "  Actionable: $isActionable"
+        Write-Host "  Health:     $healthAssessmentSummary"
+        if ($healthKeyFindings) {
+          Write-Host "  Findings:   $healthKeyFindings"
+        }
         Write-Host "  Log chars:  $($containerLogs.Length)"
 
   # ── Publish log artifacts ──────────────────────────────────────────────────
@@ -635,11 +943,18 @@ steps:
   # ── Gate: Abort if alert is not actionable ─────────────────────────────────
   - task: PowerShell@2
     displayName: 'Gate: Is alert actionable?'
+    condition: and(succeeded(), eq(variables['GateFalseAlarm.proceedWithAnalysis'], 'true'))
     inputs:
       targetType: inline
       pwsh: true
       script: |
-        $actionable = "$(DetectAlert.isActionable)"
+        $actionable = '$(DetectAlert.isActionable)'
+
+        if ([string]::IsNullOrWhiteSpace($actionable) -or $actionable -eq '$(DetectAlert.isActionable)') {
+          Write-Host "##[error]DetectAlert output 'isActionable' is missing. Ensure DetectAlert ran and produced output variables."
+          exit 1
+        }
+
         if ($actionable -ne "true") {
           Write-Host "##[warning]Alert is not actionable (infrastructure/config/transient issue)."
           Write-Host "##vso[task.complete result=SucceededWithIssues;]Alert not actionable — no code fix needed"

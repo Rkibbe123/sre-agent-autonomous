@@ -29,6 +29,12 @@ parameters:
     type: string
   - name: affectedComponent
     type: string
+  - name: healthAssessmentSummary
+    type: string
+    default: ''
+  - name: healthKeyFindings
+    type: string
+    default: ''
   - name: containerLogs
     type: string
     default: ''
@@ -59,10 +65,58 @@ steps:
         $project = "${{ parameters.targetProject }}"
         $repoName = "${{ parameters.targetRepo }}"
         $pat = "$(System.AccessToken)"
+        if ([string]::IsNullOrWhiteSpace($pat)) {
+          Write-Host "##[error]System.AccessToken is empty. Enable OAuth token access for the pipeline and grant repo permissions to the build identity."
+          exit 1
+        }
+        $workDir = "${{ parameters.workingDirectory }}"
+
+        if (Test-Path "$workDir/.git") {
+          Write-Host "Repository already checked out at '$workDir' — reusing existing checkout." -ForegroundColor Green
+          Set-Location "$workDir"
+          git checkout "${{ parameters.targetBranch }}" 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "##[warning]Could not checkout branch '${{ parameters.targetBranch }}' on existing checkout. Continuing with current HEAD."
+            $global:LASTEXITCODE = 0
+          }
+          $headSha = git rev-parse --short HEAD
+          Write-Host "HEAD is at $headSha" -ForegroundColor Green
+          Write-Host "##vso[task.setvariable variable=headSha;isOutput=true]$headSha"
+          exit 0
+        }
+
+        $projectEncoded = [System.Uri]::EscapeDataString($project)
+        $repoEncoded = [System.Uri]::EscapeDataString($repoName)
 
         # Build the clone URL using System.AccessToken
         $encodedPat = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(":$pat"))
-        $cloneUrl = "$orgUrl/$project/_git/$repoName"
+
+        # Preflight: resolve repository using Azure DevOps REST API
+        $reposUrl = "$orgUrl/$projectEncoded/_apis/git/repositories?api-version=7.1"
+        try {
+          $reposResp = Invoke-RestMethod -Uri $reposUrl -Headers @{ Authorization = "Basic $encodedPat" } -TimeoutSec 30
+        } catch {
+          Write-Host "##[error]Failed to query repositories in project '$project'."
+          Write-Host "##[error]Ensure pipeline build identity has 'Code: Read' in this project/repo."
+          Write-Host "##[error]Details: $($_.Exception.Message)"
+          exit 1
+        }
+
+        $repo = $reposResp.value | Where-Object { $_.name -ieq $repoName -or $_.id -eq $repoName } | Select-Object -First 1
+        if (-not $repo) {
+          $visibleRepos = @($reposResp.value | ForEach-Object { $_.name })
+          Write-Host "##[error]Repository '$repoName' not found or not visible in project '$project'."
+          if ($visibleRepos.Count -gt 0) {
+            Write-Host "Visible repositories: $($visibleRepos -join ', ')"
+          }
+          Write-Host "##[error]Set parameter 'targetRepo' to an existing repo or grant permissions to the pipeline identity."
+          exit 1
+        }
+
+        $cloneUrl = $repo.remoteUrl
+        if (-not $cloneUrl) {
+          $cloneUrl = "$orgUrl/$projectEncoded/_git/$repoEncoded"
+        }
 
         Write-Host "Cloning: $cloneUrl (branch: ${{ parameters.targetBranch }})"
 
@@ -70,14 +124,14 @@ steps:
           --branch "${{ parameters.targetBranch }}" `
           --depth 50 `
           "$cloneUrl" `
-          "${{ parameters.workingDirectory }}"
+          "$workDir"
 
         if ($LASTEXITCODE -ne 0) {
           Write-Host "##[error]Failed to clone repository"
           exit 1
         }
 
-        Set-Location "${{ parameters.workingDirectory }}"
+        Set-Location "$workDir"
         $headSha = git rev-parse --short HEAD
         Write-Host "HEAD is at $headSha" -ForegroundColor Green
         Write-Host "##vso[task.setvariable variable=headSha;isOutput=true]$headSha"
@@ -113,21 +167,56 @@ steps:
 
         Write-Host ""
         Write-Host "##[group]Recent git history (last 20 commits)"
-        $recentCommits = git log --oneline -20 --format="%h %s" 2>$null
-        $recentCommits | Write-Host
+        $recentCommits = @(git log --oneline -20 --format="%h %s" 2>$null)
+        if ($LASTEXITCODE -ne 0) {
+          $recentCommits = @()
+          $global:LASTEXITCODE = 0
+        }
+
+        if ($recentCommits.Count -gt 0) {
+          $recentCommits | Write-Host
+        } else {
+          Write-Host "(no commit history available)"
+        }
         Write-Host "##[endgroup]"
         ($recentCommits -join "`n") | Out-File -FilePath "$(Build.ArtifactStagingDirectory)/recent_commits.txt" -Encoding utf8
 
         Write-Host ""
         Write-Host "##[group]Files changed in last 10 commits"
-        $recentlyChanged = git diff --name-only HEAD~10..HEAD 2>$null | Sort-Object -Unique
+        $commitCount = 0
+        $commitCountRaw = git rev-list --count HEAD 2>$null
+        if ($LASTEXITCODE -eq 0 -and $commitCountRaw -match '^\d+$') {
+          $commitCount = [int]$commitCountRaw
+        } else {
+          $global:LASTEXITCODE = 0
+        }
+
+        $recentlyChanged = @()
+        if ($commitCount -gt 1) {
+          $lookback = [Math]::Min(10, $commitCount - 1)
+          $recentlyChanged = @(git diff --name-only "HEAD~$lookback..HEAD" 2>$null | Sort-Object -Unique)
+          if ($LASTEXITCODE -ne 0) {
+            $recentlyChanged = @()
+            $global:LASTEXITCODE = 0
+          }
+        }
+
+        if ($recentlyChanged.Count -eq 0) {
+          $recentlyChanged = @(git show --name-only --pretty="" HEAD 2>$null | Where-Object { $_ } | Sort-Object -Unique)
+          if ($LASTEXITCODE -ne 0) {
+            $recentlyChanged = @()
+            $global:LASTEXITCODE = 0
+          }
+        }
+
         if ($recentlyChanged) { $recentlyChanged | Write-Host }
         else { Write-Host "(fewer than 10 commits)" }
         Write-Host "##[endgroup]"
 
         # Set output for the context size
         Write-Host "##vso[task.setvariable variable=repoFileCount;isOutput=true]$($allFiles.Count)"
-        Write-Host "##vso[task.setvariable variable=recentCommitCount;isOutput=true]$(($recentCommits | Measure-Object).Count)"
+        Write-Host "##vso[task.setvariable variable=recentCommitCount;isOutput=true]$(@($recentCommits).Count)"
+        $global:LASTEXITCODE = 0
 
   # ── AI-powered root cause analysis via SRE Agent ───────────────────────────
   - task: AzureCLI@2
@@ -146,6 +235,7 @@ steps:
         $helpersPath = "$(Agent.TempDirectory)/sre-agent-helpers.ps1"
         if (Test-Path $helpersPath) { . $helpersPath }
 
+        $mgmtToken = az account get-access-token --resource https://management.azure.com --query accessToken -o tsv
         $aiToken = az account get-access-token --resource https://cognitiveservices.azure.com --query accessToken -o tsv
         $subscriptionId = az account show --query id -o tsv
 
@@ -154,89 +244,172 @@ steps:
         $alertSummary      = "${{ parameters.alertSummary }}"
         $errorSignature    = "${{ parameters.errorSignature }}"
         $affectedComponent = "${{ parameters.affectedComponent }}"
+        $healthAssessmentSummary = "${{ parameters.healthAssessmentSummary }}"
+        $healthKeyFindings = "${{ parameters.healthKeyFindings }}"
 
-        # ── Search for files related to the error ──
-        Write-Host "Searching for relevant source files..." -ForegroundColor Yellow
+        # ── Build candidate file inventory ──
+        Write-Host "Indexing repository for root-cause analysis..." -ForegroundColor Yellow
 
         $codeExtensions = @('.py', '.js', '.ts', '.cs', '.java', '.go', '.rb', '.rs',
                             '.jsx', '.tsx', '.vue', '.swift', '.kt', '.scala',
                             '.yaml', '.yml', '.json', '.toml', '.tf', '.bicep',
                             '.dockerfile', '.sh', '.ps1', '.csx')
+        $excludeDirs = @('.git', 'node_modules', '.venv', 'vendor', '__pycache__', 'bin', 'obj', '.next', 'dist', '.tox')
 
-        $searchTerms = @($affectedComponent, $errorSignature) |
-          Where-Object { $_ -and $_ -ne "Unknown" -and $_ -ne "Unknown error" } |
-          ForEach-Object { $_.ToLower() }
+        $allCodeFiles = @(
+          Get-ChildItem -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object {
+              $path = $_.FullName
+              $ext = $_.Extension.ToLower()
+              ($codeExtensions -contains $ext) -and
+              -not ($excludeDirs | Where-Object { $path -match [regex]::Escape($_) })
+            } |
+            ForEach-Object {
+              [PSCustomObject]@{
+                relPath  = $_.FullName.Replace("${{ parameters.workingDirectory }}", ".").Replace("\", "/")
+                fullPath = $_.FullName
+                length   = $_.Length
+              }
+            } |
+            Sort-Object relPath
+        )
 
-        $relevantFiles = @()
-        $excludeDirs = @('.git', 'node_modules', '.venv', 'vendor', '__pycache__', 'bin', 'obj')
+        Write-Host "Indexed $($allCodeFiles.Count) source file(s)." -ForegroundColor Green
 
-        Get-ChildItem -Recurse -File -ErrorAction SilentlyContinue |
-          Where-Object {
-            $path = $_.FullName
-            $ext = $_.Extension.ToLower()
-            ($codeExtensions -contains $ext) -and
-            -not ($excludeDirs | Where-Object { $path -match [regex]::Escape($_) })
-          } |
-          ForEach-Object {
-            $relPath = $_.FullName.Replace("${{ parameters.workingDirectory }}", ".").Replace("\", "/")
-            $lowerPath = $relPath.ToLower()
+        $rawSearchInputs = @($affectedComponent, $errorSignature, $alertSummary, $healthKeyFindings)
+        $searchTerms = @()
+        foreach ($inputTerm in $rawSearchInputs) {
+          if (-not [string]::IsNullOrWhiteSpace($inputTerm) -and $inputTerm -ne "Unknown" -and $inputTerm -ne "Unknown error") {
+            $lowerTerm = $inputTerm.ToLower()
+            $searchTerms += $lowerTerm
+            $searchTerms += ($lowerTerm -split '[^a-z0-9_./-]+' | Where-Object { $_ -and $_.Length -ge 4 })
+          }
+        }
+        $searchTerms = @($searchTerms | Sort-Object -Unique | Select-Object -First 50)
 
-            # Check filename match
-            if ($searchTerms | Where-Object { $lowerPath -match [regex]::Escape($_) }) {
-              $relevantFiles += $relPath
-              return
+        $matchedFiles = New-Object 'System.Collections.Generic.List[string]'
+        if ($searchTerms.Count -gt 0) {
+          Write-Host "Searching for files matching diagnostic terms..." -ForegroundColor Yellow
+          foreach ($file in $allCodeFiles) {
+            $lowerPath = $file.relPath.ToLower()
+            $isMatch = $false
+
+            foreach ($term in $searchTerms) {
+              if ($lowerPath -match [regex]::Escape($term)) {
+                $isMatch = $true
+                break
+              }
             }
 
-            # Quick content scan for smaller files (<50KB)
-            if ($_.Length -lt 50000) {
-              $content = Get-Content $_.FullName -Raw -ErrorAction SilentlyContinue
+            if (-not $isMatch -and $file.length -lt 120000) {
+              $content = Get-Content $file.fullPath -Raw -ErrorAction SilentlyContinue
               if ($content) {
+                if ($content.Length -gt 24000) {
+                  $content = $content.Substring(0, 24000)
+                }
                 $lowerContent = $content.ToLower()
-                if ($searchTerms | Where-Object { $lowerContent -match [regex]::Escape($_) }) {
-                  $relevantFiles += $relPath
+                foreach ($term in $searchTerms) {
+                  if ($lowerContent -match [regex]::Escape($term)) {
+                    $isMatch = $true
+                    break
+                  }
                 }
               }
             }
-          }
 
-        $relevantFiles = $relevantFiles | Select-Object -First 15
-        Write-Host "Found $($relevantFiles.Count) relevant file(s)"
-        $relevantFiles | ForEach-Object { Write-Host "  - $_" }
-
-        # ── Build code context for the AI ──
-        $repoStructure = Get-Content "$(Build.ArtifactStagingDirectory)/repo_structure.txt" -Raw -ErrorAction SilentlyContinue
-        $recentCommits = Get-Content "$(Build.ArtifactStagingDirectory)/recent_commits.txt" -Raw -ErrorAction SilentlyContinue
-
-        $codeContext = "=== REPOSITORY STRUCTURE ===`n$($repoStructure | Select-Object -First 200)`n`n"
-        $codeContext += "=== RECENT COMMITS ===`n$recentCommits`n`n"
-        $codeContext += "=== RELEVANT SOURCE FILES ===`n"
-
-        $charBudget = 50000
-        $charsUsed = 0
-
-        foreach ($f in $relevantFiles) {
-          $fullPath = Join-Path "${{ parameters.workingDirectory }}" ($f -replace '^\.\/', '')
-          if (Test-Path $fullPath) {
-            $fileContent = Get-Content $fullPath -Raw -ErrorAction SilentlyContinue
-            if ($fileContent.Length -gt 6000) {
-              $fileContent = $fileContent.Substring(0, 6000) + "`n... [truncated]"
+            if ($isMatch -and -not $matchedFiles.Contains($file.relPath)) {
+              [void]$matchedFiles.Add($file.relPath)
             }
-            $entry = "`n--- $f ---`n$fileContent`n"
-            if (($charsUsed + $entry.Length) -gt $charBudget) { break }
-            $codeContext += $entry
-            $charsUsed += $entry.Length
           }
         }
 
-        Write-Host "Context size: $($codeContext.Length) characters"
+        $matchedFileList = @($matchedFiles)
+        Write-Host "Matched file candidates: $($matchedFileList.Count)"
+        $matchedFileList | Select-Object -First 20 | ForEach-Object { Write-Host "  - $_" }
 
-        # ── Call SRE Agent / AI for root cause analysis ──
-        Write-Host "`nRunning AI root cause analysis..." -ForegroundColor Yellow
+        $allRelPaths = @($allCodeFiles | ForEach-Object { $_.relPath })
 
-        $diagContext = @"
+        $primaryFiles = @($matchedFileList | Select-Object -First 30)
+        if ($primaryFiles.Count -lt 30) {
+          $primaryFill = @($allRelPaths | Where-Object { $_ -notin $primaryFiles } | Select-Object -First (30 - $primaryFiles.Count))
+          $primaryFiles += $primaryFill
+        }
+
+        $deepFiles = @($matchedFileList | Select-Object -First 90)
+        if ($deepFiles.Count -lt 90) {
+          $deepFill = @($allRelPaths | Where-Object { $_ -notin $deepFiles } | Select-Object -First (90 - $deepFiles.Count))
+          $deepFiles += $deepFill
+        }
+
+        Write-Host "Primary file set size: $($primaryFiles.Count)"
+        Write-Host "Deep file set size:    $($deepFiles.Count)"
+
+        $repoStructureRaw = Get-Content "$(Build.ArtifactStagingDirectory)/repo_structure.txt" -Raw -ErrorAction SilentlyContinue
+        $recentCommitsRaw = Get-Content "$(Build.ArtifactStagingDirectory)/recent_commits.txt" -Raw -ErrorAction SilentlyContinue
+
+        $repoStructurePreview = if ($repoStructureRaw) { ($repoStructureRaw -split "`n" | Select-Object -First 700) -join "`n" } else { "" }
+        $recentCommitsPreview = if ($recentCommitsRaw) { ($recentCommitsRaw -split "`n" | Select-Object -First 80) -join "`n" } else { "" }
+
+        function Build-CodeContext {
+          param(
+            [string[]]$SelectedFiles,
+            [int]$MaxFiles,
+            [int]$PerFileCharLimit,
+            [int]$TotalCharBudget,
+            [string]$ModeLabel,
+            [string]$RepoRoot,
+            [string]$RepoStructureText,
+            [string]$RecentCommitsText
+          )
+
+          $ctx = "=== ANALYSIS MODE ===`n$ModeLabel`n`n"
+          $ctx += "=== REPOSITORY STRUCTURE ===`n$RepoStructureText`n`n"
+          $ctx += "=== RECENT COMMITS ===`n$RecentCommitsText`n`n"
+          $ctx += "=== RELEVANT SOURCE FILES ===`n"
+
+          $charsUsed = 0
+          $usedFiles = @()
+
+          foreach ($f in ($SelectedFiles | Select-Object -First $MaxFiles)) {
+            $fullPath = Join-Path $RepoRoot ($f -replace '^\.\/', '')
+            if (-not (Test-Path $fullPath)) { continue }
+
+            $fileContent = Get-Content $fullPath -Raw -ErrorAction SilentlyContinue
+            if (-not $fileContent) { continue }
+
+            if ($fileContent.Length -gt $PerFileCharLimit) {
+              $fileContent = $fileContent.Substring(0, $PerFileCharLimit) + "`n... [truncated]"
+            }
+
+            $entry = "`n--- $f ---`n$fileContent`n"
+            if (($charsUsed + $entry.Length) -gt $TotalCharBudget) { break }
+
+            $ctx += $entry
+            $charsUsed += $entry.Length
+            $usedFiles += $f
+          }
+
+          return [PSCustomObject]@{
+            context = $ctx
+            filesUsed = @($usedFiles)
+            charsUsed = $charsUsed
+          }
+        }
+
+        function New-DiagnosisPrompt {
+          param(
+            [string]$CodeContext,
+            [string]$PassLabel
+          )
+
+        @"
         ALERT SUMMARY: $alertSummary
         ERROR SIGNATURE: $errorSignature
         AFFECTED COMPONENT: $affectedComponent
+        ANALYSIS PASS: $PassLabel
+
+        HEALTH ASSESSMENT SUMMARY: $healthAssessmentSummary
+        HEALTH KEY FINDINGS: $healthKeyFindings
 
         === CONTAINER APP RUNTIME LOGS ===
         ${{ parameters.containerLogs }}
@@ -248,10 +421,16 @@ steps:
         You are an expert SRE root-cause analysis agent. You have:
         1. The Container App's actual runtime error logs above
         2. The source code from the ms-inventory repository
+        3. A structured live-health assessment from the Detect stage
 
         Correlate the error in the logs with the source code to find the EXACT root
         cause. Look for stack traces, exception types, and error messages in the logs
         that map to specific lines/functions in the code.
+        Use the health assessment as context (for recency/severity and service status),
+        but prioritize concrete log/code evidence for root-cause claims.
+
+        If confidence is low, expand hypotheses across related modules and identify
+        additional file candidates that should be inspected or patched.
 
         Respond in valid JSON with these keys:
         - rootCauseAnalysis: A detailed explanation of what code is causing the error
@@ -260,59 +439,243 @@ steps:
         - suggestedFix: A concise description of the code changes needed to fix the error
         - confidence: "high", "medium", or "low"
         "@
+        }
+
+        function Parse-DiagnosisJson {
+          param([string]$ResponseText)
+
+          $result = [PSCustomObject]@{
+            success = $false
+            rootCause = ""
+            affectedFiles = ""
+            suggestedFix = ""
+            confidence = "low"
+          }
+
+          if ([string]::IsNullOrWhiteSpace($ResponseText)) {
+            return $result
+          }
+
+          $parsed = $null
+          try {
+            $parsed = $ResponseText | ConvertFrom-Json -ErrorAction Stop
+          } catch {
+            if ($ResponseText -match '(?s)\{.*\}') {
+              try {
+                $parsed = $Matches[0] | ConvertFrom-Json -ErrorAction Stop
+              } catch {
+                return $result
+              }
+            } else {
+              return $result
+            }
+          }
+
+          if ($parsed.rootCauseAnalysis) { $result.rootCause = "$($parsed.rootCauseAnalysis)" }
+          if ($parsed.affectedFiles)     { $result.affectedFiles = "$($parsed.affectedFiles)" }
+          if ($parsed.suggestedFix)      { $result.suggestedFix = "$($parsed.suggestedFix)" }
+          if ($parsed.confidence) {
+            $conf = "$($parsed.confidence)".ToLower()
+            if ($conf -in @('high', 'medium', 'low')) {
+              $result.confidence = $conf
+            }
+          }
+
+          $result.success = $true
+          return $result
+        }
+
+        $primaryContextPack = Build-CodeContext `
+          -SelectedFiles $primaryFiles `
+          -MaxFiles 30 `
+          -PerFileCharLimit 9000 `
+          -TotalCharBudget 90000 `
+          -ModeLabel "PRIMARY" `
+          -RepoRoot "${{ parameters.workingDirectory }}" `
+          -RepoStructureText $repoStructurePreview `
+          -RecentCommitsText $recentCommitsPreview
+
+        Write-Host "Primary context size: $($primaryContextPack.charsUsed) chars across $($primaryContextPack.filesUsed.Count) file(s)."
+
+        $diagContext = New-DiagnosisPrompt -CodeContext $primaryContextPack.context -PassLabel "PRIMARY"
+
+        Write-Host "`nRunning primary AI root cause analysis..." -ForegroundColor Yellow
+
+        $analysisMode = "primary"
+        $analysisProvider = "sre-agent-or-openai-fallback"
+        $analysisResponseText = ""
 
         $sreResult = Invoke-SREAgentAPI `
           -Action "diagnostics" `
           -Context $diagContext `
-          -Token $aiToken `
+          -Token $mgmtToken `
+          -AIFallbackToken $aiToken `
           -Endpoint "${{ parameters.azureOpenAIEndpoint }}" `
           -Deployment "${{ parameters.azureOpenAIDeployment }}" `
           -SubscriptionId $subscriptionId `
           -SREAgentName "${{ parameters.sreAgentName }}" `
           -SREAgentResourceGroup "${{ parameters.sreAgentResourceGroup }}"
 
+        if ($sreResult.success) {
+          $analysisResponseText = "$($sreResult.response)"
+          Write-Host "`nPrimary analysis response:" -ForegroundColor Cyan
+          Write-Host $analysisResponseText
+        } else {
+          Write-Host "##[warning]Primary SRE Agent analysis failed"
+        }
+
         # ── Parse and output results ──
         $rootCause    = "Unable to determine root cause"
         $affFiles     = ""
         $suggestedFix = ""
+        $confidence   = "low"
 
-        if ($sreResult.success) {
-          Write-Host "`nSRE Agent response:" -ForegroundColor Cyan
-          Write-Host $sreResult.response
-
-          try {
-            $parsed = $sreResult.response | ConvertFrom-Json -ErrorAction Stop
-            if ($parsed.rootCauseAnalysis) { $rootCause    = $parsed.rootCauseAnalysis }
-            if ($parsed.affectedFiles)     { $affFiles     = $parsed.affectedFiles }
-            if ($parsed.suggestedFix)      { $suggestedFix = $parsed.suggestedFix }
-
-            Write-Host "`nConfidence: $($parsed.confidence)" -ForegroundColor $(
-              switch ($parsed.confidence) { "high" { "Green" } "medium" { "Yellow" } default { "Red" } }
-            )
-          } catch {
-            $rootCause = $sreResult.response.Substring(0, [Math]::Min(500, $sreResult.response.Length))
-          }
-        } else {
-          Write-Host "##[warning]SRE Agent root cause analysis failed"
+        $primaryParsed = Parse-DiagnosisJson -ResponseText $analysisResponseText
+        if ($primaryParsed.success) {
+          if ($primaryParsed.rootCause) { $rootCause = $primaryParsed.rootCause }
+          if ($primaryParsed.affectedFiles) { $affFiles = $primaryParsed.affectedFiles }
+          if ($primaryParsed.suggestedFix) { $suggestedFix = $primaryParsed.suggestedFix }
+          $confidence = $primaryParsed.confidence
+        } elseif ($analysisResponseText) {
+          $rootCause = $analysisResponseText.Substring(0, [Math]::Min(500, $analysisResponseText.Length))
         }
+
+        $needsDeepAnalysis = (-not $primaryParsed.success) -or ($confidence -eq "low") -or [string]::IsNullOrWhiteSpace($affFiles)
+
+        if ($needsDeepAnalysis) {
+          Write-Host "`nLow-confidence diagnosis detected — running deep second-pass analysis." -ForegroundColor Yellow
+
+          $deepContextPack = Build-CodeContext `
+            -SelectedFiles $deepFiles `
+            -MaxFiles 90 `
+            -PerFileCharLimit 12000 `
+            -TotalCharBudget 170000 `
+            -ModeLabel "DEEP-SECOND-PASS" `
+            -RepoRoot "${{ parameters.workingDirectory }}" `
+            -RepoStructureText $repoStructurePreview `
+            -RecentCommitsText $recentCommitsPreview
+
+          Write-Host "Deep context size: $($deepContextPack.charsUsed) chars across $($deepContextPack.filesUsed.Count) file(s)."
+
+          $deepDiagContext = New-DiagnosisPrompt -CodeContext $deepContextPack.context -PassLabel "DEEP-SECOND-PASS"
+          $deepResponseText = ""
+          $deepSuccess = $false
+
+          if (-not [string]::IsNullOrWhiteSpace("${{ parameters.azureOpenAIEndpoint }}") -and -not [string]::IsNullOrWhiteSpace($aiToken)) {
+            Write-Host "Deep pass provider: Azure OpenAI direct endpoint" -ForegroundColor Cyan
+            $analysisProvider = "azure-openai-direct"
+            $analysisMode = "deep-second-pass"
+
+            $systemPrompt = @"
+            You are an expert SRE root-cause analysis agent.
+            Analyze the full context and return ONLY valid JSON with keys:
+            rootCauseAnalysis, affectedFiles, suggestedFix, confidence.
+            Confidence must be one of: high, medium, low.
+            "@
+
+            $openAiBody = @{
+              model = "${{ parameters.azureOpenAIDeployment }}"
+              max_completion_tokens = 16384
+              reasoning_effort = "high"
+              messages = @(
+                @{ role = "system"; content = $systemPrompt }
+                @{ role = "user"; content = $deepDiagContext }
+              )
+            } | ConvertTo-Json -Depth 10
+
+            try {
+              $deepRaw = Invoke-RestMethod -Uri "${{ parameters.azureOpenAIEndpoint }}" `
+                -Method POST `
+                -Headers @{ "Authorization" = "Bearer $aiToken"; "Content-Type" = "application/json" } `
+                -Body $openAiBody `
+                -TimeoutSec 180
+
+              if (Get-Command Get-AIResponseText -ErrorAction SilentlyContinue) {
+                $deepResponseText = Get-AIResponseText -Response $deepRaw
+              }
+              if (-not $deepResponseText) {
+                $deepResponseText = $deepRaw | ConvertTo-Json -Depth 12
+              }
+              $deepSuccess = $true
+            } catch {
+              Write-Host "##[warning]Direct Azure OpenAI deep pass failed: $($_.Exception.Message)"
+            }
+          }
+
+          if (-not $deepSuccess) {
+            Write-Host "Deep pass fallback provider: SRE Agent API / OpenAI fallback" -ForegroundColor Cyan
+            $analysisProvider = "sre-agent-or-openai-fallback"
+            $analysisMode = "deep-second-pass-fallback"
+
+            $deepResult = Invoke-SREAgentAPI `
+              -Action "diagnostics" `
+              -Context $deepDiagContext `
+              -Token $mgmtToken `
+              -AIFallbackToken $aiToken `
+              -Endpoint "${{ parameters.azureOpenAIEndpoint }}" `
+              -Deployment "${{ parameters.azureOpenAIDeployment }}" `
+              -SubscriptionId $subscriptionId `
+              -SREAgentName "${{ parameters.sreAgentName }}" `
+              -SREAgentResourceGroup "${{ parameters.sreAgentResourceGroup }}"
+
+            if ($deepResult.success) {
+              $deepResponseText = "$($deepResult.response)"
+              $deepSuccess = $true
+            }
+          }
+
+          if ($deepSuccess) {
+            $analysisResponseText = $deepResponseText
+            Write-Host "`nDeep analysis response:" -ForegroundColor Cyan
+            Write-Host $analysisResponseText
+
+            $deepParsed = Parse-DiagnosisJson -ResponseText $analysisResponseText
+            if ($deepParsed.success) {
+              if ($deepParsed.rootCause) { $rootCause = $deepParsed.rootCause }
+              if ($deepParsed.affectedFiles) { $affFiles = $deepParsed.affectedFiles }
+              if ($deepParsed.suggestedFix) { $suggestedFix = $deepParsed.suggestedFix }
+              $confidence = $deepParsed.confidence
+            } elseif ($analysisResponseText) {
+              $rootCause = $analysisResponseText.Substring(0, [Math]::Min(500, $analysisResponseText.Length))
+            }
+          } else {
+            Write-Host "##[warning]Deep second-pass analysis failed; keeping primary diagnosis"
+          }
+        }
+
+        Write-Host "`nAnalysis provider: $analysisProvider"
+        Write-Host "Analysis mode: $analysisMode"
+        Write-Host "Confidence: $confidence" -ForegroundColor $(
+          switch ($confidence) { "high" { "Green" } "medium" { "Yellow" } default { "Red" } }
+        )
 
         # Sanitize
         $rootCause    = ($rootCause    -replace '[\r\n]+', ' ').Trim()
         $affFiles     = ($affFiles     -replace '[\r\n]+', ' ').Trim()
         $suggestedFix = ($suggestedFix -replace '[\r\n]+', ' ').Trim()
+        $analysisProvider = ($analysisProvider -replace '[\r\n]+', ' ').Trim()
+        $analysisMode = ($analysisMode -replace '[\r\n]+', ' ').Trim()
+        $confidence = ($confidence -replace '[\r\n]+', ' ').Trim()
 
         Write-Host "##vso[task.setvariable variable=rootCauseAnalysis;isOutput=true]$rootCause"
         Write-Host "##vso[task.setvariable variable=affectedFiles;isOutput=true]$affFiles"
         Write-Host "##vso[task.setvariable variable=suggestedFix;isOutput=true]$suggestedFix"
+        Write-Host "##vso[task.setvariable variable=analysisProvider;isOutput=true]$analysisProvider"
+        Write-Host "##vso[task.setvariable variable=analysisMode;isOutput=true]$analysisMode"
+        Write-Host "##vso[task.setvariable variable=analysisConfidence;isOutput=true]$confidence"
 
         Write-Host ""
         Write-Host "ROOT CAUSE ANALYSIS:" -ForegroundColor Green
         Write-Host "  Cause:    $rootCause"
         Write-Host "  Files:    $affFiles"
         Write-Host "  Fix:      $suggestedFix"
+        Write-Host "  Provider: $analysisProvider"
+        Write-Host "  Mode:     $analysisMode"
+        Write-Host "  Confidence:$confidence"
 
         # Save full analysis artifact
-        $sreResult.response | Out-File -FilePath "$(Build.ArtifactStagingDirectory)/root_cause_analysis.txt" -Encoding utf8
+        $responseToPersist = if ($analysisResponseText) { $analysisResponseText } else { $rootCause }
+        $responseToPersist | Out-File -FilePath "$(Build.ArtifactStagingDirectory)/root_cause_analysis.txt" -Encoding utf8
 
   # ── Publish diagnosis artifacts ────────────────────────────────────────────
   - task: PublishPipelineArtifact@1

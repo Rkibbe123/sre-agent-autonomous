@@ -51,12 +51,42 @@ steps:
         $project = "${{ parameters.targetProject }}"
         $repoName = "${{ parameters.targetRepo }}"
         $pat = "$(System.AccessToken)"
+        if ([string]::IsNullOrWhiteSpace($pat)) {
+          Write-Host "##[error]System.AccessToken is empty. Enable OAuth token access for the pipeline and grant repo permissions to the build identity."
+          exit 1
+        }
         $encodedPat = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(":$pat"))
+        $projectEncoded = [System.Uri]::EscapeDataString($project)
+        $repoEncoded = [System.Uri]::EscapeDataString($repoName)
 
         $workDir = "${{ parameters.workingDirectory }}"
 
         if (-not (Test-Path "$workDir/.git")) {
-          $cloneUrl = "$orgUrl/$project/_git/$repoName"
+          $reposUrl = "$orgUrl/$projectEncoded/_apis/git/repositories?api-version=7.1"
+          try {
+            $reposResp = Invoke-RestMethod -Uri $reposUrl -Headers @{ Authorization = "Basic $encodedPat" } -TimeoutSec 30
+          } catch {
+            Write-Host "##[error]Failed to query repositories in project '$project'."
+            Write-Host "##[error]Ensure pipeline build identity has 'Code: Read' in this project/repo."
+            Write-Host "##[error]Details: $($_.Exception.Message)"
+            exit 1
+          }
+
+          $repo = $reposResp.value | Where-Object { $_.name -ieq $repoName -or $_.id -eq $repoName } | Select-Object -First 1
+          if (-not $repo) {
+            $visibleRepos = @($reposResp.value | ForEach-Object { $_.name })
+            Write-Host "##[error]Repository '$repoName' not found or not visible in project '$project'."
+            if ($visibleRepos.Count -gt 0) {
+              Write-Host "Visible repositories: $($visibleRepos -join ', ')"
+            }
+            Write-Host "##[error]Set parameter 'targetRepo' to an existing repo or grant permissions to the pipeline identity."
+            exit 1
+          }
+
+          $cloneUrl = $repo.remoteUrl
+          if (-not $cloneUrl) {
+            $cloneUrl = "$orgUrl/$projectEncoded/_git/$repoEncoded"
+          }
           Write-Host "Cloning: $cloneUrl"
           git -c http.extraHeader="Authorization: Basic $encodedPat" clone `
             --branch "${{ parameters.targetBranch }}" --depth 50 `
@@ -90,6 +120,7 @@ steps:
         $helpersPath = "$(Agent.TempDirectory)/sre-agent-helpers.ps1"
         if (Test-Path $helpersPath) { . $helpersPath }
 
+        $mgmtToken = az account get-access-token --resource https://management.azure.com --query accessToken -o tsv
         $aiToken = az account get-access-token --resource https://cognitiveservices.azure.com --query accessToken -o tsv
         $subscriptionId = az account show --query id -o tsv
 
@@ -146,12 +177,13 @@ steps:
           Add brief comments explaining the fix where appropriate.
           Return ONLY the complete fixed file content — no explanations, no markdown fences,
           no text before or after the file content.
-          "@
+        "@
 
           $sreResult = Invoke-SREAgentAPI `
             -Action "mitigate" `
             -Context $fixContext `
-            -Token $aiToken `
+            -Token $mgmtToken `
+            -AIFallbackToken $aiToken `
             -Endpoint "${{ parameters.azureOpenAIEndpoint }}" `
             -Deployment "${{ parameters.azureOpenAIDeployment }}" `
             -SubscriptionId $subscriptionId `
@@ -196,7 +228,8 @@ steps:
         $summaryResult = Invoke-SREAgentAPI `
           -Action "diagnostics" `
           -Context $summaryContext `
-          -Token $aiToken `
+          -Token $mgmtToken `
+          -AIFallbackToken $aiToken `
           -Endpoint "${{ parameters.azureOpenAIEndpoint }}" `
           -Deployment "${{ parameters.azureOpenAIDeployment }}" `
           -SubscriptionId $subscriptionId `
