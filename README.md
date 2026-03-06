@@ -1,16 +1,16 @@
 # SRE Autonomous Agent Pipeline
 
-An Azure DevOps pipeline that automatically **reviews Container App logs**, **diagnoses root causes**, **generates code fixes**, and **creates Pull Requests** in the [`ai-app-svcs`](https://dev.azure.com/3Cloud/DevSecOps%20SRE%20Community%20Sandbox/_git/ai-app-svcs) repo — triggered by webhook alerts from your Container App.
+An Azure DevOps pipeline that automatically **reviews Web App logs**, **diagnoses root causes**, **generates code fixes**, and **creates Pull Requests** in the [`ai-app-svcs`](https://dev.azure.com/3Cloud/DevSecOps%20SRE%20Community%20Sandbox/_git/ai-app-svcs) repo — triggered by webhook alerts from your Web App.
 
 Built on the same **Azure SRE Agent** + **Azure OpenAI** patterns used in `sre-agent`, with `AzureCLI@2` + PowerShell Core + `Invoke-SREAgentAPI` for all AI interactions.
 
 ## Architecture
 
 ```
-Container App Error ──► Webhook ──► Azure DevOps Pipeline
+Web App Error ──► Webhook ──► Azure DevOps Pipeline
                                          │
                                          ├─ 🔍 Stage 1: Review Logs
-                                         │     SRE Agent queries Container App logs
+                                         │     SRE Agent queries Web App logs
                                          │     from Log Analytics (KQL), analyzes errors
                                          │
                                          ├─ 🔬 Stage 2: Diagnose Root Cause
@@ -29,7 +29,7 @@ Container App Error ──► Webhook ──► Azure DevOps Pipeline
 ├── azure-pipelines.yml              # Main pipeline definition
 ├── templates/
 │   ├── sre-agent-common.yml         # Shared helpers (from sre-agent repo)
-│   ├── detect-failure.yml           # Stage 1: Container App log query & analysis
+│   ├── detect-failure.yml           # Stage 1: Web App log query & analysis
 │   ├── diagnose-root-cause.yml      # Stage 2: Log-to-code correlation & diagnosis
 │   ├── propose-fix.yml              # Stage 3: AI code fix generation & validation
 │   └── create-pull-request.yml      # Stage 4: PR creation in ai-app-svcs
@@ -44,7 +44,7 @@ Container App Error ──► Webhook ──► Azure DevOps Pipeline
 - Endpoint: `https://rkibbe--88208374.4650bed8.eastus2.azuresre.ai`
 
 ### Azure OpenAI
-- Endpoint: `https://rkibbe-chat-demo-resource.openai.azure.com/openai/v1/chat/completions`
+- Endpoint: `https://rkibbe-chat-demo-resource.openai.azure.com/openai/v1/responses`
 - Deployment: `agentic-deveops-agent` (gpt-5.3-codex)
 - Authenticated via Azure service connection (no API key needed)
 
@@ -54,9 +54,9 @@ Container App Error ──► Webhook ──► Azure DevOps Pipeline
 - `System.AccessToken` used for repo clone + PR creation (no separate PAT required)
 - Pipeline permissions: **Code** Read/Write, **Pull Requests** Read/Write on `ai-app-svcs`
 
-### Container App
-- Container App: `azure-resource-inventory` in resource group `rg-rkibbe-2470`
-- Log Analytics workspace connected via the Container App Environment
+### Web App
+- Web App: `dev-ai-app-svcs-web` in resource group `rg-rkibbe-2470`
+- Log Analytics workspace connected via the Web App diagnostics configuration
 - The pipeline defaults to workspace `2898ab68-ba5c-4175-a5a2-437b4f7b97f0` for this repo
 
 ## Setup
@@ -69,7 +69,7 @@ The Azure OpenAI endpoint and deployment are hardcoded in the pipeline variables
 
 | Variable | Value |
 |---|---|
-| `azureOpenAIEndpoint` | `https://rkibbe-chat-demo-resource.openai.azure.com/openai/v1/chat/completions` |
+| `azureOpenAIEndpoint` | `https://rkibbe-chat-demo-resource.openai.azure.com/openai/v1/responses` |
 | `azureOpenAIDeployment` | `agentic-deveops-agent` |
 | `sre_agent_resource_group` | `rg-rkibbe-2470` |
 | `sre_agent_name` | `rkibbe` |
@@ -114,7 +114,7 @@ POST https://dev.azure.com/3Cloud/DevSecOps%20SRE%20Community%20Sandbox/_apis/pi
     "serviceName": "dev-ai-app-svcs-web",
     "severity": "high",
     "incidentId": "INC-12345",
-    "containerAppName": "azure-resource-inventory",
+    "containerAppName": "dev-ai-app-svcs-web",
     "containerAppResourceGroup": "rg-rkibbe-2470"
   }
 }
@@ -142,16 +142,16 @@ POST https://dev.azure.com/3Cloud/DevSecOps%20SRE%20Community%20Sandbox/_apis/pi
 | `serviceName` | No | `dev-ai-app-svcs-web` | Name of the affected service |
 | `severity` | No | `high` | Alert severity: critical, high, medium, low |
 | `incidentId` | No | `AUTO` | Incident/alert tracking ID |
-| `containerAppName` | No | `azure-resource-inventory` | Azure Container App name |
-| `containerAppResourceGroup` | No | `rg-rkibbe-2470` | Resource group of the Container App |
+| `containerAppName` | No | `dev-ai-app-svcs-web` | Azure Web App name |
+| `containerAppResourceGroup` | No | `rg-rkibbe-2470` | Resource group of the Web App |
 | `logAnalyticsWorkspace` | No | `2898ab68-ba5c-4175-a5a2-437b4f7b97f0` | Log Analytics workspace ID |
 | `logTimespan` | No | `PT1H` | How far back to query logs (ISO 8601 duration) |
 
 ## How It Works
 
-### Stage 1 — Review Container App Logs
+### Stage 1 — Review Web App Logs
 - Parses the incoming webhook alert payload
-- Queries the Container App's **console logs** (`ContainerAppConsoleLogs_CL`) and **system logs** (`ContainerAppSystemLogs_CL`) from Log Analytics via KQL
+- Queries the app's **console logs** (`ContainerAppConsoleLogs_CL`) and **system logs** (`ContainerAppSystemLogs_CL`) from Log Analytics via KQL
 - Uses the configured Log Analytics workspace ID (`2898ab68-ba5c-4175-a5a2-437b4f7b97f0`)
 - SRE Agent analyzes the combined logs + alert to extract: error signature, affected component, stack trace patterns
 - Gates the pipeline if the issue is not code-actionable (infrastructure/transient)
@@ -160,7 +160,7 @@ POST https://dev.azure.com/3Cloud/DevSecOps%20SRE%20Community%20Sandbox/_apis/pi
 - Clones the [`ai-app-svcs`](https://dev.azure.com/3Cloud/DevSecOps%20SRE%20Community%20Sandbox/_git/ai-app-svcs) repository
 - Maps the repo structure and identifies recently changed files
 - Searches for source files related to the error signature from the logs
-- Azure OpenAI **correlates the Container App runtime logs with the source code** to identify the exact root cause
+- Azure OpenAI **correlates runtime logs with the source code** to identify the exact root cause
 - Outputs: root cause explanation, affected file list, and suggested fix
 
 ### Stage 3 — Generate Code Fix
@@ -171,7 +171,7 @@ POST https://dev.azure.com/3Cloud/DevSecOps%20SRE%20Community%20Sandbox/_apis/pi
 
 ### Stage 4 — Create Pull Request
 - Creates a PR in `ai-app-svcs` via the Azure DevOps REST API
-- Rich description includes: Container App logs excerpt, root cause analysis, code changes, and validation results
+- Rich description includes: Web App logs excerpt, root cause analysis, code changes, and validation results
 - Labels the PR (`sre-agent`, `severity-{level}`, `auto-generated`)
 - Optionally enables auto-complete for low-severity issues
 

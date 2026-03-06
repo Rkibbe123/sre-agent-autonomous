@@ -24,7 +24,7 @@ param(
     [string]$PipelineId        = "738",
     [string]$SubscriptionId    = "d5736eb1-f851-4ec3-a2c5-ac8d84d029e2",
     [string]$ResourceGroup     = "rg-rkibbe-2470",
-    [string]$ContainerAppName  = "azure-resource-inventory",
+    [string]$ContainerAppName  = "dev-ai-app-svcs-web",
     [string]$WebhookName       = "ContainerAppAlert",
     [string]$ConnectionName    = "SREAlertWebhookConnection738",
     [string]$ActionGroupName   = "az-resource-action-grp",
@@ -66,7 +66,7 @@ Write-Host "============================================" -ForegroundColor Cyan
 Write-Host "  Organization:   $Organization"
 Write-Host "  Project:        $Project"
 Write-Host "  Pipeline:       $PipelineId"
-Write-Host "  Container App:  $ContainerAppName"
+Write-Host "  Web App:        $ContainerAppName"
 Write-Host "  Resource Group: $ResourceGroup"
 Write-Host ""
 

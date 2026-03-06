@@ -1,13 +1,13 @@
 # =============================================================================
-# Template: Detect Failure — Container App Log Review
+# Template: Detect Failure — Web App Log Review
 # =============================================================================
-# Queries the Container App's runtime logs from Log Analytics, then uses the
+# Queries the Web App's runtime logs from Log Analytics, then uses the
 # SRE Agent to analyze the logs alongside the webhook alert payload.
 #
 # Flow:
 #   1. Parse the incoming webhook alert payload
-#   2. Query Container App console & system logs via Log Analytics (KQL)
-#   3. Live health check — SRE Agent queries Container App status, replicas,
+#   2. Query Web App console & system logs via Log Analytics (KQL)
+#   3. Live health check — SRE Agent queries Web App status, replicas,
 #      ingress metrics, and Resource Health to detect false alarms / transient glitches
 #   4. Gate: abort early if the app is healthy now (false alarm)
 #   5. SRE Agent reviews logs → structured triage output
@@ -55,6 +55,39 @@ parameters:
     default: ''
 
 steps:
+  # ── Trigger receipt (always print at top) ─────────────────────────────────
+  - task: PowerShell@2
+    name: TriggerReceipt
+    displayName: 'Trigger receipt'
+    inputs:
+      targetType: inline
+      pwsh: true
+      script: |
+        $essentialsSeverity = $env:CONTAINERAPPALERT_DATA_ESSENTIALS_SEVERITY
+        $alertRule          = $env:CONTAINERAPPALERT_DATA_ESSENTIALS_ALERTRULE
+        $alertId            = $env:CONTAINERAPPALERT_DATA_ESSENTIALS_ALERTID
+        $description        = $env:CONTAINERAPPALERT_DATA_ESSENTIALS_DESCRIPTION
+        $firedDateTime      = $env:CONTAINERAPPALERT_DATA_ESSENTIALS_FIREDDATETIME
+        $monitorCondition   = $env:CONTAINERAPPALERT_DATA_ESSENTIALS_MONITORCONDITION
+
+        Write-Host "============================================" -ForegroundColor Cyan
+        Write-Host "TRIGGER RECEIPT" -ForegroundColor Cyan
+        Write-Host "============================================" -ForegroundColor Cyan
+        Write-Host "  Build Reason:  $(Build.Reason)"
+        Write-Host "  Build ID:      $(Build.BuildId)"
+
+        if ($essentialsSeverity -or $alertRule -or $alertId) {
+          Write-Host "  Trigger Type:  Webhook" -ForegroundColor Green
+          Write-Host "  Alert Rule:    $alertRule"
+          Write-Host "  Severity:      $essentialsSeverity"
+          Write-Host "  Alert ID:      $alertId"
+          Write-Host "  Fired At:      $firedDateTime"
+          Write-Host "  Condition:     $monitorCondition"
+          Write-Host "  Description:   $description"
+        } else {
+          Write-Host "  Trigger Type:  Manual/API (no webhook essentials detected)" -ForegroundColor Yellow
+        }
+
   # ── Parse Azure Monitor Webhook Payload (if triggered by alert) ────────────
   - task: PowerShell@2
     name: ParseWebhook
@@ -111,17 +144,17 @@ steps:
           Write-Host "##vso[task.setvariable variable=isWebhookTriggered;isOutput=true]false"
         }
 
-  # ── Query Container App logs from Log Analytics ────────────────────────────
+  # ── Query Web App logs from Log Analytics ──────────────────────────────────
   - task: AzureCLI@2
     name: FetchLogs
-    displayName: 'SRE Agent: Pull Container App Logs'
+    displayName: 'SRE Agent: Pull Web App Logs'
     inputs:
       azureSubscription: '${{ parameters.azureServiceConnection }}'
       scriptType: pscore
       scriptLocation: inlineScript
       inlineScript: |
         Write-Host "============================================" -ForegroundColor Cyan
-        Write-Host "   SRE AGENT: CONTAINER APP LOG REVIEW       " -ForegroundColor Cyan
+        Write-Host "   SRE AGENT: WEB APP LOG REVIEW             " -ForegroundColor Cyan
         Write-Host "   App:      ${{ parameters.containerAppName }}" -ForegroundColor Cyan
         Write-Host "   Severity: ${{ parameters.severity }}"        -ForegroundColor Cyan
         Write-Host "   Incident: ${{ parameters.incidentId }}"      -ForegroundColor Cyan
@@ -136,11 +169,11 @@ steps:
 
         # ── Auto-discover Log Analytics workspace if not provided ──
         if (-not $workspaceId) {
-          Write-Host "No workspace ID provided — auto-discovering from Container App..." -ForegroundColor Yellow
+          Write-Host "No workspace ID provided — auto-discovering from Web App..." -ForegroundColor Yellow
 
           if (-not $containerRG) {
-            # Try to find the Container App's resource group
-            Write-Host "Searching for Container App '$containerApp'..."
+            # Try to find the Web App's resource group
+            Write-Host "Searching for Web App '$containerApp'..."
             $caInfo = az containerapp show --name $containerApp --query "{rg:resourceGroup, envId:properties.environmentId}" -o json 2>$null | ConvertFrom-Json
             if ($caInfo) {
               $containerRG = $caInfo.rg
@@ -153,7 +186,7 @@ steps:
           }
 
           if ($containerRG) {
-            # Get the Container App Environment, then its Log Analytics config
+            # Get the Web App environment, then its Log Analytics config
             $envId = az containerapp show -n $containerApp -g $containerRG --query "properties.environmentId" -o tsv 2>$null
             if ($envId) {
               $envName = ($envId -split '/')[-1]
@@ -179,7 +212,7 @@ steps:
 
         # ── Query ContainerAppConsoleLogs (application stdout/stderr) ──
         Write-Host ""
-        Write-Host "Querying Container App console logs (errors & warnings)..." -ForegroundColor Yellow
+        Write-Host "Querying Web App console logs (errors & warnings)..." -ForegroundColor Yellow
 
         $consoleKql = @"
         ContainerAppConsoleLogs_CL
@@ -204,7 +237,7 @@ steps:
         $consoleRows = $consoleLogs | ConvertFrom-Json
         Write-Host "  Retrieved $($consoleRows.Count) console log entries" -ForegroundColor Green
 
-        Write-Host "##[group]Container App Console Logs"
+        Write-Host "##[group]Web App Console Logs"
         foreach ($row in $consoleRows | Select-Object -First 30) {
           $ts = if ($row.TimeGenerated) { $row.TimeGenerated } else { "?" }
           $msg = if ($row.Log_s) { $row.Log_s.Substring(0, [Math]::Min(200, $row.Log_s.Length)) } else { "" }
@@ -213,7 +246,7 @@ steps:
         Write-Host "##[endgroup]"
 
         # ── Query ContainerAppSystemLogs (platform-level events) ──
-        Write-Host "Querying Container App system logs..." -ForegroundColor Yellow
+        Write-Host "Querying Web App system logs..." -ForegroundColor Yellow
 
         $systemKql = @"
         ContainerAppSystemLogs_CL
@@ -238,7 +271,7 @@ steps:
         $systemRows = $systemLogs | ConvertFrom-Json
         Write-Host "  Retrieved $($systemRows.Count) system log entries" -ForegroundColor Green
 
-        Write-Host "##[group]Container App System Logs"
+        Write-Host "##[group]Web App System Logs"
         foreach ($row in $systemRows | Select-Object -First 20) {
           Write-Host "[$($row.TimeGenerated)] $($row.Type_s)/$($row.Reason_s): $($row.Log_s)"
         }
@@ -248,14 +281,14 @@ steps:
         $logExcerpt = ""
 
         if ($consoleRows.Count -gt 0) {
-          $logExcerpt += "=== CONTAINER APP CONSOLE LOGS (errors/warnings) ===`n"
+          $logExcerpt += "=== WEB APP CONSOLE LOGS (errors/warnings) ===`n"
           foreach ($row in $consoleRows | Select-Object -First 50) {
             $logExcerpt += "[$($row.TimeGenerated)] $($row.Log_s)`n"
           }
         }
 
         if ($systemRows.Count -gt 0) {
-          $logExcerpt += "`n=== CONTAINER APP SYSTEM LOGS ===`n"
+          $logExcerpt += "`n=== WEB APP SYSTEM LOGS ===`n"
           foreach ($row in $systemRows | Select-Object -First 20) {
             $logExcerpt += "[$($row.TimeGenerated)] $($row.Type_s)/$($row.Reason_s): $($row.Log_s)`n"
           }
@@ -299,6 +332,7 @@ steps:
         $healthSignals = @()
         $unhealthySignals = @()
         $isHealthyNow  = $true
+        $falseAlarmConfidenceThreshold = 80
         $targetResourceId = ""
         $targetResourceType = ""
         $targetResourceName = ""
@@ -330,7 +364,7 @@ steps:
           $targetResourceType = "Microsoft.App/containerApps"
           $targetResourceName = $containerApp
           $targetResourceGroup = $containerRG
-          Write-Host "App Service '$serviceName' not found. Falling back to Container App '$containerApp'." -ForegroundColor Yellow
+          Write-Host "App Service '$serviceName' not found. Falling back to Web App target '$containerApp'." -ForegroundColor Yellow
         }
 
         # ── 2. Collect runtime signals for resolved target resource ──
@@ -357,6 +391,46 @@ steps:
           } else {
             Write-Host "  ##[warning]Could not query App Service status"
             $healthSignals += "App Service status: UNKNOWN"
+            $isHealthyNow = $false
+            $unhealthySignals += "Could not query App Service runtime status"
+          }
+
+          Write-Host "Checking App Service HTTP probe..." -ForegroundColor Yellow
+          $defaultHost = if ($webApp -and $webApp.defaultHostName) { "$($webApp.defaultHostName)" } else { "$targetResourceName.azurewebsites.net" }
+          $healthPath = "/"
+          if ($webApp -and $webApp.siteConfig -and $webApp.siteConfig.healthCheckPath) {
+            $healthPath = "$($webApp.siteConfig.healthCheckPath)"
+            if (-not $healthPath.StartsWith("/")) {
+              $healthPath = "/$healthPath"
+            }
+          }
+          $probeUrl = "https://$defaultHost$healthPath"
+          try {
+            $probe = Invoke-WebRequest -Uri $probeUrl -Method GET -TimeoutSec 20 -MaximumRedirection 3 -SkipHttpErrorCheck
+            $probeStatus = [int]$probe.StatusCode
+            $probeBody = ""
+            if ($probe.Content) {
+              $probeBody = "$($probe.Content)"
+            }
+
+            Write-Host "  Probe URL:    $probeUrl"
+            Write-Host "  Probe Status: $probeStatus"
+            $healthSignals += "HttpProbeStatus: $probeStatus ($probeUrl)"
+
+            if ($probeStatus -lt 200 -or $probeStatus -ge 300) {
+              $isHealthyNow = $false
+              $unhealthySignals += "HTTP probe returned non-2xx status $probeStatus at $probeUrl"
+            }
+
+            if ($probeBody -match 'Application Error|ContainerTimeout|WaitingForSiteWarmUpProbeSuccess|warmup') {
+              $isHealthyNow = $false
+              $unhealthySignals += "HTTP probe body indicates startup/warm-up failure"
+            }
+          } catch {
+            $isHealthyNow = $false
+            $healthSignals += "HttpProbeStatus: ERROR ($probeUrl)"
+            $unhealthySignals += "HTTP probe failed at ${probeUrl}: $($_.Exception.Message)"
+            Write-Host "  ##[warning]HTTP probe failed: $($_.Exception.Message)"
           }
 
           Write-Host "Checking App Service diagnostic settings..." -ForegroundColor Yellow
@@ -375,7 +449,7 @@ steps:
           }
           $global:LASTEXITCODE = 0
         } else {
-          Write-Host "Checking Container App status..." -ForegroundColor Yellow
+          Write-Host "Checking Web App fallback target status..." -ForegroundColor Yellow
           $caStatus = az containerapp show -n $containerApp -g $containerRG -o json 2>$null | ConvertFrom-Json
 
           if ($caStatus) {
@@ -405,8 +479,8 @@ steps:
               $unhealthySignals += "Running state is '$runningState'"
             }
           } else {
-            Write-Host "  ##[warning]Could not query Container App status"
-            $healthSignals += "Container App status: UNKNOWN"
+            Write-Host "  ##[warning]Could not query Web App fallback target status"
+            $healthSignals += "Web App status: UNKNOWN"
           }
 
           Write-Host "Checking revision replicas..." -ForegroundColor Yellow
@@ -512,7 +586,7 @@ steps:
         }
 
         Rules:
-        - Set isFalseAlarm=true only when currentStatus is healthy and confidence >= 70.
+        - Set isFalseAlarm=true only when currentStatus is healthy and confidence >= $falseAlarmConfidenceThreshold.
         - If evidence is incomplete, set currentStatus=unknown and isFalseAlarm=false.
         - Keep reason short and concrete.
         "@
@@ -574,12 +648,12 @@ steps:
               $isFalseAlarm = "false"
             }
 
-            if ($isFalseAlarm -eq "true" -and $confidence -lt 70) {
+            if ($isFalseAlarm -eq "true" -and $confidence -lt $falseAlarmConfidenceThreshold) {
               $isFalseAlarm = "false"
               if ($reason) {
-                $reason = "$reason Confidence below threshold ($confidence)."
+                $reason = "$reason Confidence below threshold ($confidence < $falseAlarmConfidenceThreshold)."
               } else {
-                $reason = "Confidence below threshold ($confidence)."
+                $reason = "Confidence below threshold ($confidence < $falseAlarmConfidenceThreshold)."
               }
               $recommendedNextAction = "continue-diagnose"
             }
@@ -630,6 +704,31 @@ steps:
 
         if (-not $recommendedNextAction) {
           $recommendedNextAction = if ($isFalseAlarm -eq "true") { "skip-diagnose" } else { "continue-diagnose" }
+        }
+
+        # ── Final guardrails (apply regardless of AI/fallback path) ──
+        if ($isFalseAlarm -eq "true" -and $currentStatus -ne "healthy") {
+          $isFalseAlarm = "false"
+          if ($reason) {
+            $reason = "$reason Status '$currentStatus' is not eligible for false alarm."
+          } else {
+            $reason = "Status '$currentStatus' is not eligible for false alarm."
+          }
+        }
+
+        if ($isFalseAlarm -eq "true" -and $confidence -lt $falseAlarmConfidenceThreshold) {
+          $isFalseAlarm = "false"
+          if ($reason) {
+            $reason = "$reason Confidence below threshold ($confidence < $falseAlarmConfidenceThreshold)."
+          } else {
+            $reason = "Confidence below threshold ($confidence < $falseAlarmConfidenceThreshold)."
+          }
+        }
+
+        if ($isFalseAlarm -eq "true") {
+          $recommendedNextAction = "skip-diagnose"
+        } else {
+          $recommendedNextAction = "continue-diagnose"
         }
 
         $findingsArray = @()
@@ -789,14 +888,14 @@ steps:
         }
         Write-Host "##[endgroup]"
 
-        # ── Load Container App logs from previous step ──
+        # ── Load Web App logs from previous step ──
         $containerLogs = ""
         $logFile = "$(Build.ArtifactStagingDirectory)/container_logs.txt"
         if (Test-Path $logFile) {
           $containerLogs = Get-Content $logFile -Raw -ErrorAction SilentlyContinue
-          Write-Host "Loaded $($containerLogs.Length) chars of Container App logs" -ForegroundColor Green
+          Write-Host "Loaded $($containerLogs.Length) chars of Web App logs" -ForegroundColor Green
         } else {
-          Write-Host "No Container App logs available — using alert payload only" -ForegroundColor Yellow
+          Write-Host "No Web App logs available — using alert payload only" -ForegroundColor Yellow
         }
 
         # ── SRE Agent: Combined log + alert analysis ──
@@ -804,7 +903,7 @@ steps:
 
         $analysisContext = @"
         SERVICE: ${{ parameters.serviceName }}
-        CONTAINER APP: ${{ parameters.containerAppName }}
+        WEB APP: ${{ parameters.containerAppName }}
         SEVERITY: ${{ parameters.severity }}
         INCIDENT_ID: ${{ parameters.incidentId }}
 
@@ -820,11 +919,11 @@ steps:
         === WEBHOOK ALERT PAYLOAD ===
         $($payloadObj | ConvertTo-Json -Depth 10 -Compress)
 
-        === CONTAINER APP RUNTIME LOGS ===
+        === WEB APP RUNTIME LOGS ===
         $containerLogs
 
         INSTRUCTIONS:
-        You are an SRE agent triaging a Container App failure. Analyze BOTH the alert
+        You are an SRE agent triaging a Web App failure. Analyze BOTH the alert
         payload AND the runtime logs above. Extract the following:
 
         1. alertSummary - A concise one-line summary of the failure based on the logs
@@ -869,7 +968,13 @@ steps:
             if ($parsed.alertSummary)       { $alertSummary = $parsed.alertSummary }
             if ($parsed.errorSignature)     { $errorSignature = $parsed.errorSignature }
             if ($parsed.affectedComponent)  { $affectedComponent = $parsed.affectedComponent }
-            if ($parsed.isActionable)       { $isActionable = "$($parsed.isActionable)" }
+            if ($null -ne $parsed.isActionable) {
+              if ($parsed.isActionable -is [bool]) {
+                $isActionable = if ($parsed.isActionable) { "true" } else { "false" }
+              } else {
+                $isActionable = "$($parsed.isActionable)"
+              }
+            }
             if ($parsed.healthAssessmentSummary) { $healthAssessmentSummary = "$($parsed.healthAssessmentSummary)" }
             if ($parsed.healthKeyFindings) {
               if ($parsed.healthKeyFindings -is [System.Array]) {
@@ -901,6 +1006,14 @@ steps:
         $alertSummary       = ($alertSummary       -replace '[\r\n]+', ' ').Trim()
         $errorSignature     = ($errorSignature     -replace '[\r\n]+', ' ').Trim()
         $affectedComponent  = ($affectedComponent  -replace '[\r\n]+', ' ').Trim()
+        $isActionable       = ($isActionable       -replace '[\r\n]+', ' ').Trim().ToLower()
+        if ($isActionable -notin @('true', 'false')) {
+          if ($isActionable -in @('1', 'yes', 'y')) {
+            $isActionable = 'true'
+          } else {
+            $isActionable = 'false'
+          }
+        }
         $healthAssessmentSummary = ($healthAssessmentSummary -replace '[\r\n]+', ' ').Trim()
         $healthKeyFindings = ($healthKeyFindings -replace '[\r\n]+', ' ').Trim()
 
@@ -914,6 +1027,7 @@ steps:
         Write-Host "##vso[task.setvariable variable=alertSummary;isOutput=true]$alertSummary"
         Write-Host "##vso[task.setvariable variable=errorSignature;isOutput=true]$errorSignature"
         Write-Host "##vso[task.setvariable variable=affectedComponent;isOutput=true]$affectedComponent"
+        Write-Host "##vso[task.setvariable variable=isActionable]$isActionable"
         Write-Host "##vso[task.setvariable variable=isActionable;isOutput=true]$isActionable"
         Write-Host "##vso[task.setvariable variable=healthAssessmentSummary;isOutput=true]$healthAssessmentSummary"
         Write-Host "##vso[task.setvariable variable=healthKeyFindings;isOutput=true]$healthKeyFindings"
@@ -933,7 +1047,7 @@ steps:
 
   # ── Publish log artifacts ──────────────────────────────────────────────────
   - task: PublishPipelineArtifact@1
-    displayName: 'Publish Container App logs'
+    displayName: 'Publish Web App logs'
     condition: always()
     inputs:
       targetPath: '$(Build.ArtifactStagingDirectory)'
@@ -942,22 +1056,97 @@ steps:
 
   # ── Gate: Abort if alert is not actionable ─────────────────────────────────
   - task: PowerShell@2
+    name: GateActionable
     displayName: 'Gate: Is alert actionable?'
     condition: and(succeeded(), eq(variables['GateFalseAlarm.proceedWithAnalysis'], 'true'))
     inputs:
       targetType: inline
       pwsh: true
       script: |
-        $actionable = '$(DetectAlert.isActionable)'
+        $actionableFromOutput = '$(DetectAlert.isActionable)'
+        $actionableFromVar = '$(isActionable)'
+        $healthStatusRaw = '$(HealthCheck.currentStatus)'
+        $healthReasonRaw = '$(HealthCheck.healthReason)'
+        $healthNextActionRaw = '$(HealthCheck.healthNextAction)'
+        $healthFalseAlarmRaw = '$(HealthCheck.isFalseAlarm)'
+        $actionable = $actionableFromOutput
 
-        if ([string]::IsNullOrWhiteSpace($actionable) -or $actionable -eq '$(DetectAlert.isActionable)') {
-          Write-Host "##[error]DetectAlert output 'isActionable' is missing. Ensure DetectAlert ran and produced output variables."
-          exit 1
+        function Test-UnresolvedMacro {
+          param([string]$Value)
+          return [string]::IsNullOrWhiteSpace($Value) -or $Value -match '^\$\([^)]+\)$'
         }
 
-        if ($actionable -ne "true") {
+        function Normalize-BoolString {
+          param([string]$Value)
+          $normalized = "$Value".Trim().ToLower()
+          if ($normalized -in @('1','yes','y')) { return 'true' }
+          if ($normalized -in @('0','no','n')) { return 'false' }
+          return $normalized
+        }
+
+        function Set-GateOutputs {
+          param(
+            [string]$ProceedAnalysis,
+            [string]$ProceedFix
+          )
+
+          Write-Host "##vso[task.setvariable variable=proceedWithAnalysis;isOutput=true]$ProceedAnalysis"
+          Write-Host "##vso[task.setvariable variable=proceedWithFix;isOutput=true]$ProceedFix"
+        }
+
+        $healthStatus = "$healthStatusRaw".Trim().ToLower()
+        $healthReason = "$healthReasonRaw".Trim().ToLower()
+        $healthNextAction = "$healthNextActionRaw".Trim().ToLower()
+        $healthFalseAlarm = Normalize-BoolString "$healthFalseAlarmRaw"
+
+        $hasHealthImpact = $false
+        if (-not (Test-UnresolvedMacro $healthStatusRaw) -and $healthStatus -in @('unhealthy', 'degraded')) {
+          $hasHealthImpact = $true
+        }
+        if (-not (Test-UnresolvedMacro $healthReasonRaw) -and ($healthReason -match 'failed|timeout|timed out|error|exception|unavailable|degraded|warm-up|warmup|stopped|forbidden|403|probe')) {
+          $hasHealthImpact = $true
+        }
+        if (-not (Test-UnresolvedMacro $healthNextActionRaw) -and $healthNextAction -eq 'continue-diagnose') {
+          $hasHealthImpact = $true
+        }
+
+        $healthSuggestsDiagnose = $hasHealthImpact -and ($healthFalseAlarm -ne 'true')
+
+        if (Test-UnresolvedMacro $actionable) {
+          if (-not (Test-UnresolvedMacro $actionableFromVar)) {
+            $actionable = $actionableFromVar
+          }
+        }
+
+        if (Test-UnresolvedMacro $actionable) {
+          if ($healthSuggestsDiagnose) {
+            Write-Host "##[warning]DetectAlert output 'isActionable' is missing. HealthCheck indicates active impact, so diagnosis will continue but code-fix remains gated."
+            Set-GateOutputs -ProceedAnalysis 'true' -ProceedFix 'false'
+            Write-Host "Alert will proceed to diagnosis only (status=$healthStatus, nextAction=$healthNextAction)." -ForegroundColor Yellow
+            exit 0
+          }
+
+          Write-Host "##[warning]DetectAlert output 'isActionable' is missing. Treating as non-actionable to avoid false failures."
+          Set-GateOutputs -ProceedAnalysis 'false' -ProceedFix 'false'
+          Write-Host "##vso[task.complete result=SucceededWithIssues;]Alert triage output missing — skipping downstream diagnosis/fix"
+          exit 0
+        }
+
+        $actionableNormalized = Normalize-BoolString "$actionable"
+
+        if ($actionableNormalized -ne "true") {
+          if ($healthSuggestsDiagnose) {
+            Write-Host "##[warning]Alert triage marked non-actionable, but HealthCheck indicates active impact. Proceeding to diagnosis-only mode."
+            Set-GateOutputs -ProceedAnalysis 'true' -ProceedFix 'false'
+            Write-Host "Alert is diagnosis-actionable by health evidence; code-fix stage remains gated." -ForegroundColor Yellow
+            exit 0
+          }
+
           Write-Host "##[warning]Alert is not actionable (infrastructure/config/transient issue)."
+          Set-GateOutputs -ProceedAnalysis 'false' -ProceedFix 'false'
           Write-Host "##vso[task.complete result=SucceededWithIssues;]Alert not actionable — no code fix needed"
-          exit 1
+          exit 0
         }
+
+        Set-GateOutputs -ProceedAnalysis 'true' -ProceedFix 'true'
         Write-Host "Alert is actionable (code-level bug) — proceeding to diagnosis." -ForegroundColor Green

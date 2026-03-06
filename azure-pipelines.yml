@@ -1,8 +1,8 @@
 # =============================================================================
 # SRE AUTONOMOUS AGENT PIPELINE
 # =============================================================================
-# Triggered by webhook from a Container App alert/error. The pipeline:
-#   1. Log Review  - SRE Agent queries Container App logs from Log Analytics
+# Triggered by webhook from a Web App alert/error. The pipeline:
+#   1. Log Review  - SRE Agent queries Web App logs from Log Analytics
 #   2. Diagnose    - Clone ms-inventory repo, AI root cause analysis w/ logs
 #   3. Fix         - Azure OpenAI generates code fix, validates, pushes branch
 #   4. PR          - Create Pull Request with logs, analysis & code changes
@@ -66,13 +66,13 @@ parameters:
     type: string
     default: 'AUTO'
 
-  # ── Container App settings ──
+  # ── Web App settings ──
   - name: containerAppName
-    displayName: 'Container App Name'
+    displayName: 'Web App Name'
     type: string
-    default: 'azure-resource-inventory'
+    default: 'dev-ai-app-svcs-web'
   - name: containerAppResourceGroup
-    displayName: 'Container App Resource Group'
+    displayName: 'Web App Resource Group'
     type: string
     default: 'rg-rkibbe-2470'
   - name: logAnalyticsWorkspace
@@ -101,7 +101,7 @@ parameters:
 variables:
   - group: databricks-dab-pipeline
   - name: azureOpenAIEndpoint
-    value: 'https://rkibbe-chat-demo-resource.openai.azure.com/openai/v1/chat/completions'
+    value: 'https://rkibbe-chat-demo-resource.openai.azure.com/openai/v1/responses'
   - name: azureOpenAIDeployment
     value: 'agentic-deveops-agent'
   - name: workingDirectory
@@ -116,10 +116,10 @@ pool:
 
 stages:
   # ═══════════════════════════════════════════════════════════════════════════
-  # Stage 1 — LOG REVIEW: SRE Agent pulls & analyzes Container App logs
+  # Stage 1 — LOG REVIEW: SRE Agent pulls & analyzes Web App logs
   # ═══════════════════════════════════════════════════════════════════════════
   - stage: Detect
-    displayName: '🔍 Review Container App Logs'
+    displayName: '🔍 Review Web App Logs'
     jobs:
       - job: DetectFailure
         displayName: 'Validate & Enrich Alert'
@@ -154,7 +154,7 @@ stages:
   - stage: Diagnose
     displayName: '🔬 Diagnose Root Cause'
     dependsOn: Detect
-    condition: and(succeeded(), eq(dependencies.Detect.outputs['DetectFailure.GateFalseAlarm.proceedWithAnalysis'], 'true'))
+    condition: and(succeeded(), eq(dependencies.Detect.outputs['DetectFailure.GateFalseAlarm.proceedWithAnalysis'], 'true'), eq(dependencies.Detect.outputs['DetectFailure.GateActionable.proceedWithAnalysis'], 'true'))
     variables:
       alertSummary: $[stageDependencies.Detect.DetectFailure.outputs['DetectAlert.alertSummary']]
       errorSignature: $[stageDependencies.Detect.DetectFailure.outputs['DetectAlert.errorSignature']]
@@ -188,12 +188,6 @@ stages:
               targetRepo: ${{ parameters.targetRepo }}
               targetBranch: ${{ parameters.targetBranch }}
               workingDirectory: $(workingDirectory)
-              alertSummary: $(alertSummary)
-              errorSignature: $(errorSignature)
-              affectedComponent: $(affectedComponent)
-              healthAssessmentSummary: $(healthAssessmentSummary)
-              healthKeyFindings: $(healthKeyFindings)
-              containerLogs: $(containerLogs)
               sreAgentResourceGroup: '${{ parameters.sre_agent_resource_group }}'
               sreAgentName: '${{ parameters.sre_agent_name }}'
 
@@ -203,7 +197,7 @@ stages:
   - stage: Fix
     displayName: '🛠️ Propose Fix'
     dependsOn: Diagnose
-    condition: and(succeeded(), eq(dependencies.Detect.outputs['DetectFailure.GateFalseAlarm.proceedWithAnalysis'], 'true'))
+    condition: and(succeeded(), eq(dependencies.Detect.outputs['DetectFailure.GateFalseAlarm.proceedWithAnalysis'], 'true'), or(eq(dependencies.Detect.outputs['DetectFailure.GateActionable.proceedWithFix'], 'true'), and(eq(dependencies.Detect.outputs['DetectFailure.GateActionable.proceedWithAnalysis'], 'true'), in(dependencies.Diagnose.outputs['DiagnoseRootCause.DiagnoseCode.analysisConfidence'], 'high', 'medium'), ne(dependencies.Diagnose.outputs['DiagnoseRootCause.DiagnoseCode.affectedFiles'], ''))))
     variables:
       rootCauseAnalysis: $[stageDependencies.Diagnose.DiagnoseRootCause.outputs['DiagnoseCode.rootCauseAnalysis']]
       affectedFiles: $[stageDependencies.Diagnose.DiagnoseRootCause.outputs['DiagnoseCode.affectedFiles']]
@@ -247,7 +241,7 @@ stages:
   - stage: PullRequest
     displayName: '📋 Create Pull Request'
     dependsOn: Fix
-    condition: and(succeeded(), eq(dependencies.Detect.outputs['DetectFailure.GateFalseAlarm.proceedWithAnalysis'], 'true'))
+    condition: and(succeeded(), eq(dependencies.Detect.outputs['DetectFailure.GateFalseAlarm.proceedWithAnalysis'], 'true'), eq(dependencies.Fix.result, 'Succeeded'), ne(dependencies.Fix.outputs['ProposeFix.GenerateFix.changedFiles'], ''))
     variables:
       fixSummary: $[stageDependencies.Fix.ProposeFix.outputs['GenerateFix.fixSummary']]
       changedFiles: $[stageDependencies.Fix.ProposeFix.outputs['GenerateFix.changedFiles']]

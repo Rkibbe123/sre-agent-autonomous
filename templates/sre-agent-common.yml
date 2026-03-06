@@ -208,32 +208,193 @@ steps:
             if ($Endpoint) {
                 $openAIToken = if ($AIFallbackToken) { $AIFallbackToken } else { $Token }
                 $sreSystemPrompt = Get-SRESystemPrompt -Action $Action
-                $body = @{
-                    model = $Deployment
-                    max_completion_tokens = 16384
-                    reasoning_effort = "high"
-                    messages = @(
-                        @{ role = "system"; content = $sreSystemPrompt }
-                        @{ role = "user"; content = "**TARGET RESOURCE:** $TargetResourceId`n**ACTION REQUESTED:** $Action`n`n**CONTEXT DATA:**`n$Context" }
-                    )
-                } | ConvertTo-Json -Depth 10
 
-                try {
-                    $response = Invoke-RestMethod -Uri $Endpoint `
-                        -Method POST `
-                        -Headers @{
-                            "Authorization" = "Bearer $openAIToken"
-                            "Content-Type" = "application/json"
-                        } `
-                        -Body $body `
-                        -TimeoutSec 120
+                $targetEndpoint = "$Endpoint".Trim()
+                if ($targetEndpoint -match '^\$\([^)]+\)$') {
+                    $result.response = "AI fallback endpoint variable is unresolved: $targetEndpoint"
+                    return $result
+                }
 
-                    $parsed = Get-AIResponseText -Response $response
-                    $result.success = $true
-                    $result.response = $parsed
-                    $result.raw = $response
-                } catch {
-                    $result.response = "SRE Agent API and AI fallback both failed: $_"
+                $targetEndpoint = $targetEndpoint.TrimEnd('/')
+                if ($targetEndpoint -match '/openai/v1$') {
+                    $targetEndpoint = "$targetEndpoint/chat/completions"
+                } elseif ($targetEndpoint -match '/openai$') {
+                    $targetEndpoint = "$targetEndpoint/v1/chat/completions"
+                } elseif ($targetEndpoint -notmatch '/openai/') {
+                    $targetEndpoint = "$targetEndpoint/openai/v1/chat/completions"
+                }
+
+                $lowerEndpoint = $targetEndpoint.ToLowerInvariant()
+                $userMessage = "**TARGET RESOURCE:** $TargetResourceId`n**ACTION REQUESTED:** $Action`n`n**CONTEXT DATA:**`n$Context"
+                $chatMessages = @(
+                    @{ role = "system"; content = $sreSystemPrompt }
+                    @{ role = "user"; content = $userMessage }
+                )
+                $isDeploymentPathEndpoint = $lowerEndpoint -match '/openai/deployments/'
+
+                function Get-HttpFailureDetail {
+                    param($ErrorRecord)
+
+                    $detail = ""
+
+                    if ($ErrorRecord -and $ErrorRecord.ErrorDetails -and $ErrorRecord.ErrorDetails.Message) {
+                        $detail = "$($ErrorRecord.ErrorDetails.Message)"
+                    }
+
+                    if ([string]::IsNullOrWhiteSpace($detail) -and
+                        $ErrorRecord -and $ErrorRecord.Exception -and
+                        $ErrorRecord.Exception.Response -and
+                        $ErrorRecord.Exception.Response.Content) {
+                        try {
+                            $detail = $ErrorRecord.Exception.Response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+                        } catch {
+                            # fall back to exception text
+                        }
+                    }
+
+                    if ([string]::IsNullOrWhiteSpace($detail) -and $ErrorRecord -and $ErrorRecord.Exception) {
+                        $detail = "$($ErrorRecord.Exception.Message)"
+                    }
+
+                    $detail = ($detail -replace '[\r\n]+', ' ').Trim()
+                    if ($detail.Length -gt 600) {
+                        $detail = $detail.Substring(0, 600) + "..."
+                    }
+
+                    return $detail
+                }
+
+                $attempts = New-Object 'System.Collections.Generic.List[object]'
+
+                if ($lowerEndpoint -match '/responses(\?|$)') {
+                    $responsesWithLimit = @{
+                        input = @(
+                            @{ role = "system"; content = $sreSystemPrompt }
+                            @{ role = "user"; content = $userMessage }
+                        )
+                        max_output_tokens = 4096
+                    }
+                    if (-not $isDeploymentPathEndpoint) { $responsesWithLimit.model = $Deployment }
+                    $attempts.Add([PSCustomObject]@{
+                        label = "responses-max_output_tokens"
+                        endpoint = $targetEndpoint
+                        body = ($responsesWithLimit | ConvertTo-Json -Depth 12)
+                    })
+
+                    $responsesMinimal = @{
+                        input = @(
+                            @{ role = "system"; content = $sreSystemPrompt }
+                            @{ role = "user"; content = $userMessage }
+                        )
+                    }
+                    if (-not $isDeploymentPathEndpoint) { $responsesMinimal.model = $Deployment }
+                    $attempts.Add([PSCustomObject]@{
+                        label = "responses-minimal"
+                        endpoint = $targetEndpoint
+                        body = ($responsesMinimal | ConvertTo-Json -Depth 12)
+                    })
+
+                    if (-not $isDeploymentPathEndpoint) {
+                        $chatEndpoint = $targetEndpoint -replace '/responses(\?|$)', '/chat/completions$1'
+                        if ($chatEndpoint -ne $targetEndpoint) {
+                            $chatFallbackBody = @{
+                                model = $Deployment
+                                messages = $chatMessages
+                                max_completion_tokens = 4096
+                            } | ConvertTo-Json -Depth 12
+
+                            $attempts.Add([PSCustomObject]@{
+                                label = "chat-fallback-max_completion_tokens"
+                                endpoint = $chatEndpoint
+                                body = $chatFallbackBody
+                            })
+                        }
+                    }
+                } else {
+                    $chatWithCompletionTokens = @{
+                        messages = $chatMessages
+                        max_completion_tokens = 4096
+                    }
+                    if (-not $isDeploymentPathEndpoint) { $chatWithCompletionTokens.model = $Deployment }
+                    $attempts.Add([PSCustomObject]@{
+                        label = "chat-max_completion_tokens"
+                        endpoint = $targetEndpoint
+                        body = ($chatWithCompletionTokens | ConvertTo-Json -Depth 12)
+                    })
+
+                    $chatWithMaxTokens = @{
+                        messages = $chatMessages
+                        max_tokens = 4096
+                    }
+                    if (-not $isDeploymentPathEndpoint) { $chatWithMaxTokens.model = $Deployment }
+                    $attempts.Add([PSCustomObject]@{
+                        label = "chat-max_tokens"
+                        endpoint = $targetEndpoint
+                        body = ($chatWithMaxTokens | ConvertTo-Json -Depth 12)
+                    })
+
+                    $chatMinimal = @{
+                        messages = $chatMessages
+                    }
+                    if (-not $isDeploymentPathEndpoint) { $chatMinimal.model = $Deployment }
+                    $attempts.Add([PSCustomObject]@{
+                        label = "chat-minimal"
+                        endpoint = $targetEndpoint
+                        body = ($chatMinimal | ConvertTo-Json -Depth 12)
+                    })
+
+                    if (-not $isDeploymentPathEndpoint) {
+                        $responsesEndpoint = $targetEndpoint -replace '/chat/completions(\?|$)', '/responses$1'
+                        if ($responsesEndpoint -ne $targetEndpoint) {
+                            $responsesFallback = @{
+                                model = $Deployment
+                                input = @(
+                                    @{ role = "system"; content = $sreSystemPrompt }
+                                    @{ role = "user"; content = $userMessage }
+                                )
+                                max_output_tokens = 4096
+                            } | ConvertTo-Json -Depth 12
+
+                            $attempts.Add([PSCustomObject]@{
+                                label = "responses-fallback"
+                                endpoint = $responsesEndpoint
+                                body = $responsesFallback
+                            })
+                        }
+                    }
+                }
+
+                $failureDetails = @()
+                foreach ($attempt in $attempts) {
+                    try {
+                        $response = Invoke-RestMethod -Uri $attempt.endpoint `
+                            -Method POST `
+                            -Headers @{
+                                "Authorization" = "Bearer $openAIToken"
+                                "Content-Type" = "application/json"
+                            } `
+                            -Body $attempt.body `
+                            -TimeoutSec 120
+
+                        $parsed = Get-AIResponseText -Response $response
+                        if ([string]::IsNullOrWhiteSpace("$parsed")) {
+                            $parsed = $response | ConvertTo-Json -Depth 12
+                        }
+
+                        $result.success = $true
+                        $result.response = $parsed
+                        $result.raw = $response
+                        return $result
+                    } catch {
+                        $detail = Get-HttpFailureDetail -ErrorRecord $_
+                        $failureDetails += "$($attempt.label): $detail"
+                    }
+                }
+
+                if ($failureDetails.Count -gt 0) {
+                    $result.response = "SRE Agent API and AI fallback both failed: " + ($failureDetails -join " | ")
+                } else {
+                    $result.response = "SRE Agent API and AI fallback both failed: no attempt was executed."
                 }
             }
 
@@ -269,10 +430,10 @@ steps:
             Flag any metrics that deviate more than 2 standard deviations from baseline.
         "@
                 "mitigate" = @"
-            You are Azure SRE Agent executing automated mitigation.
-            Analyze the incident/issue and recommend specific mitigation actions.
-            For each action, specify: the Azure CLI command, expected impact, rollback procedure, and risk level.
-            Prioritize actions by impact and safety. Always prefer reversible actions first.
+            You are Azure SRE Agent executing automated mitigation for reliability incidents.
+            If context contains "FILE TO FIX" and "CURRENT FILE CONTENT", return ONLY the corrected full file content for that file.
+            Keep changes minimal, preserve formatting/style, and avoid adding extra explanation text.
+            If no file content is provided, return concise mitigation actions prioritized by safety and reversibility.
         "@
             }
 
@@ -283,7 +444,18 @@ steps:
         function Get-AIResponseText {
             param($Response)
             if ($Response.output -and $Response.output[0].content) { return $Response.output[0].content[0].text }
-            if ($Response.choices -and $Response.choices[0].message) { return $Response.choices[0].message.content }
+            if ($Response.output_text) { return $Response.output_text }
+            if ($Response.choices -and $Response.choices[0].message) {
+                $content = $Response.choices[0].message.content
+                if ($content -is [System.Array]) {
+                    return (($content | ForEach-Object {
+                        if ($_ -and $_.text) { "$($_.text)" }
+                        elseif ($_ -and $_.content) { "$($_.content)" }
+                        else { "$_" }
+                    }) -join "")
+                }
+                return $content
+            }
             if ($Response.text) { return $Response.text }
             if ($Response.content) { return $Response.content }
             if ($Response -is [string]) { return $Response }

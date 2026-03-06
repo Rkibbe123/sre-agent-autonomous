@@ -2,7 +2,7 @@
 # Template: Propose Fix (Autonomous Pipeline)
 # =============================================================================
 # Uses Azure OpenAI to generate code changes that fix the error identified in
-# the Container App logs. Applies changes to a fix branch, validates, pushes.
+# the Web App logs. Applies changes to a fix branch, validates, pushes.
 # =============================================================================
 
 parameters:
@@ -126,15 +126,100 @@ steps:
 
         Set-Location "${{ parameters.workingDirectory }}"
 
-        $rootCause    = "${{ parameters.rootCauseAnalysis }}"
-        $suggestedFix = "${{ parameters.suggestedFix }}"
-        $affectedFilesRaw = "${{ parameters.affectedFiles }}"
+        function Resolve-PipelineText {
+          param([string]$Value)
+          if ([string]::IsNullOrWhiteSpace($Value) -or $Value -match '^\$\([^)]+\)$') {
+            return ""
+          }
+          return "$Value"
+        }
+
+        $rootCause = Resolve-PipelineText "$env:FIX_ROOT_CAUSE_ANALYSIS"
+        $suggestedFix = Resolve-PipelineText "$env:FIX_SUGGESTED_FIX"
+        $affectedFilesRaw = Resolve-PipelineText "$env:FIX_AFFECTED_FILES"
+
+        function Parse-AffectedFiles {
+          param([string]$Raw)
+
+          if ([string]::IsNullOrWhiteSpace($Raw) -or $Raw -match '^\$\([^)]+\)$') {
+            return @()
+          }
+
+          $rawTrimmed = $Raw.Trim()
+          $parts = @()
+
+          if ($rawTrimmed.StartsWith("[") -and $rawTrimmed.EndsWith("]")) {
+            try {
+              $parsed = $rawTrimmed | ConvertFrom-Json -ErrorAction Stop
+              if ($parsed -is [System.Array]) {
+                $parts = @($parsed | ForEach-Object { "$_" })
+              } else {
+                $parts = @("$parsed")
+              }
+            } catch {
+              $parts = @($Raw -split '[,;\r\n]+')
+            }
+          } else {
+            $parts = @($Raw -split '[,;\r\n]+')
+          }
+
+          return @(
+            $parts |
+            ForEach-Object { "$_".Trim() } |
+            ForEach-Object { $_ -replace '^\./', '' } |
+            Where-Object { $_ } |
+            Sort-Object -Unique
+          )
+        }
+
+        function Get-FileLikeMatchesFromText {
+          param([string]$Text)
+
+          if ([string]::IsNullOrWhiteSpace($Text)) {
+            return @()
+          }
+
+          $matches = [regex]::Matches(
+            $Text,
+            '(?i)(?:\.\/)?[a-z0-9_./-]+\.(py|js|ts|tsx|jsx|cs|java|go|rb|rs|json|yaml|yml|toml|tf|bicep|sh|ps1|csx)'
+          )
+
+          return @(
+            $matches |
+            ForEach-Object { $_.Value -replace '^\./', '' } |
+            Where-Object { $_ } |
+            Sort-Object -Unique
+          )
+        }
 
         # Parse affected files list
-        $affectedFiles = $affectedFilesRaw -split '[,;]' | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+        $affectedFiles = Parse-AffectedFiles -Raw $affectedFilesRaw
 
         if ($affectedFiles.Count -eq 0) {
-          Write-Host "##[error]No affected files specified by diagnosis"
+          $inferred = @()
+          $inferred += @(Get-FileLikeMatchesFromText -Text $rootCause)
+          $inferred += @(Get-FileLikeMatchesFromText -Text $suggestedFix)
+          $inferred = @($inferred | Sort-Object -Unique)
+
+          if ($inferred.Count -gt 0) {
+            $existingInferred = @()
+            foreach ($candidate in $inferred) {
+              $candidateFullPath = Join-Path "${{ parameters.workingDirectory }}" $candidate
+              if (Test-Path $candidateFullPath) {
+                $existingInferred += $candidate
+              }
+            }
+
+            if ($existingInferred.Count -gt 0) {
+              $affectedFiles = @($existingInferred | Sort-Object -Unique)
+              $affectedFilesRaw = $affectedFiles -join ", "
+              Write-Host "##[warning]No affected files from diagnosis output. Inferred file candidates from analysis text."
+            }
+          }
+        }
+
+        if ($affectedFiles.Count -eq 0) {
+          Write-Host "##[error]No affected files specified by diagnosis and none could be inferred from analysis text."
           exit 1
         }
 
@@ -207,6 +292,9 @@ steps:
             }
           } else {
             Write-Host "##[warning]AI fix generation failed for: $cleanPath"
+            if ($sreResult.response) {
+              Write-Host "##[warning]Failure detail: $($sreResult.response)"
+            }
           }
         }
 
@@ -247,6 +335,10 @@ steps:
         Write-Host "`nFIX SUMMARY:" -ForegroundColor Green
         Write-Host "  Summary: $fixSummary"
         Write-Host "  Changed: $changedList"
+    env:
+      FIX_ROOT_CAUSE_ANALYSIS: '${{ parameters.rootCauseAnalysis }}'
+      FIX_AFFECTED_FILES: '${{ parameters.affectedFiles }}'
+      FIX_SUGGESTED_FIX: '${{ parameters.suggestedFix }}'
 
   # ── Display the diff ───────────────────────────────────────────────────────
   - task: PowerShell@2
@@ -263,9 +355,18 @@ steps:
         Write-Host "##[endgroup]"
 
         # Verify changes exist
-        $hasChanges = git diff --quiet; $diffExit = $LASTEXITCODE
+        $null = git diff --quiet
+        $diffExit = $LASTEXITCODE
         if ($diffExit -eq 0) {
           Write-Host "##[error]No code changes were generated."
+          exit 1
+        }
+
+        if ($diffExit -eq 1) {
+          Write-Host "Detected generated code changes." -ForegroundColor Green
+          $global:LASTEXITCODE = 0
+        } else {
+          Write-Host "##[error]Unexpected git diff exit code: $diffExit"
           exit 1
         }
 

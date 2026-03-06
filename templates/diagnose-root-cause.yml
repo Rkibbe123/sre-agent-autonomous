@@ -3,7 +3,7 @@
 # =============================================================================
 # Clones the target repository (ms-inventory), builds a structural map,
 # identifies relevant source files, and uses Azure OpenAI to correlate the
-# Container App runtime logs with the codebase for root cause analysis.
+# Web App runtime logs with the codebase for root cause analysis.
 # =============================================================================
 
 parameters:
@@ -23,21 +23,6 @@ parameters:
     type: string
   - name: workingDirectory
     type: string
-  - name: alertSummary
-    type: string
-  - name: errorSignature
-    type: string
-  - name: affectedComponent
-    type: string
-  - name: healthAssessmentSummary
-    type: string
-    default: ''
-  - name: healthKeyFindings
-    type: string
-    default: ''
-  - name: containerLogs
-    type: string
-    default: ''
   - name: sreAgentResourceGroup
     type: string
     default: ''
@@ -239,13 +224,43 @@ steps:
         $aiToken = az account get-access-token --resource https://cognitiveservices.azure.com --query accessToken -o tsv
         $subscriptionId = az account show --query id -o tsv
 
-        Set-Location "${{ parameters.workingDirectory }}"
+        function Resolve-PipelineText {
+          param([string]$Value)
+          if ([string]::IsNullOrWhiteSpace($Value) -or $Value -match '^\$\([^)]+\)$') {
+            return ""
+          }
+          return "$Value"
+        }
 
-        $alertSummary      = "${{ parameters.alertSummary }}"
-        $errorSignature    = "${{ parameters.errorSignature }}"
-        $affectedComponent = "${{ parameters.affectedComponent }}"
-        $healthAssessmentSummary = "${{ parameters.healthAssessmentSummary }}"
-        $healthKeyFindings = "${{ parameters.healthKeyFindings }}"
+        $workingDirectory = Resolve-PipelineText "$env:DIAG_WORKING_DIRECTORY"
+        if ([string]::IsNullOrWhiteSpace($workingDirectory)) {
+          $workingDirectory = Resolve-PipelineText "$(workingDirectory)"
+        }
+        if ([string]::IsNullOrWhiteSpace($workingDirectory)) {
+          Write-Host "##[error]Working directory is empty for DiagnoseCode step."
+          exit 1
+        }
+
+        $azureOpenAIEndpoint = Resolve-PipelineText "$env:DIAG_OPENAI_ENDPOINT"
+        $azureOpenAIDeployment = Resolve-PipelineText "$env:DIAG_OPENAI_DEPLOYMENT"
+        if ([string]::IsNullOrWhiteSpace($azureOpenAIDeployment)) {
+          $azureOpenAIDeployment = "agentic-deveops-agent"
+        }
+        $sreAgentName = Resolve-PipelineText "$env:DIAG_SRE_AGENT_NAME"
+        $sreAgentResourceGroup = Resolve-PipelineText "$env:DIAG_SRE_AGENT_RESOURCE_GROUP"
+
+        Set-Location $workingDirectory
+
+        $alertSummary = Resolve-PipelineText "$(alertSummary)"
+        $errorSignature = Resolve-PipelineText "$(errorSignature)"
+        $affectedComponent = Resolve-PipelineText "$(affectedComponent)"
+        $healthAssessmentSummary = Resolve-PipelineText "$(healthAssessmentSummary)"
+        $healthKeyFindings = Resolve-PipelineText "$(healthKeyFindings)"
+        $containerLogs = Resolve-PipelineText "$(containerLogs)"
+
+        if ($containerLogs.Length -gt 12000) {
+          $containerLogs = $containerLogs.Substring(0, 12000) + "... [truncated]"
+        }
 
         # ── Build candidate file inventory ──
         Write-Host "Indexing repository for root-cause analysis..." -ForegroundColor Yellow
@@ -266,7 +281,7 @@ steps:
             } |
             ForEach-Object {
               [PSCustomObject]@{
-                relPath  = $_.FullName.Replace("${{ parameters.workingDirectory }}", ".").Replace("\", "/")
+                relPath  = $_.FullName.Replace($workingDirectory, ".").Replace("\", "/")
                 fullPath = $_.FullName
                 length   = $_.Length
               }
@@ -329,13 +344,57 @@ steps:
 
         $allRelPaths = @($allCodeFiles | ForEach-Object { $_.relPath })
 
-        $primaryFiles = @($matchedFileList | Select-Object -First 30)
+        $recentlyChangedCandidates = @()
+        $commitCountForDiag = 0
+        $commitCountRawForDiag = git rev-list --count HEAD 2>$null
+        if ($LASTEXITCODE -eq 0 -and $commitCountRawForDiag -match '^\d+$') {
+          $commitCountForDiag = [int]$commitCountRawForDiag
+        } else {
+          $global:LASTEXITCODE = 0
+        }
+
+        if ($commitCountForDiag -gt 1) {
+          $diagLookback = [Math]::Min(10, $commitCountForDiag - 1)
+          $recentlyChangedCandidates = @(git diff --name-only "HEAD~$diagLookback..HEAD" 2>$null | Sort-Object -Unique)
+          if ($LASTEXITCODE -ne 0) {
+            $recentlyChangedCandidates = @()
+            $global:LASTEXITCODE = 0
+          }
+        }
+
+        if ($recentlyChangedCandidates.Count -eq 0) {
+          $recentlyChangedCandidates = @(git show --name-only --pretty="" HEAD 2>$null | Where-Object { $_ } | Sort-Object -Unique)
+          if ($LASTEXITCODE -ne 0) {
+            $recentlyChangedCandidates = @()
+            $global:LASTEXITCODE = 0
+          }
+        }
+
+        $recentlyChangedCandidates = @(
+          $recentlyChangedCandidates |
+          ForEach-Object { "$_".Trim().Replace('\\', '/') } |
+          ForEach-Object { $_ -replace '^\./', '' } |
+          Where-Object { $_ } |
+          Where-Object { $_ -in $allRelPaths } |
+          Sort-Object -Unique
+        )
+
+        Write-Host "Recent changed file candidates: $($recentlyChangedCandidates.Count)"
+        $recentlyChangedCandidates | Select-Object -First 20 | ForEach-Object { Write-Host "  - $_" }
+
+        $primarySeed = @()
+        $primarySeed += $matchedFileList
+        $primarySeed += $recentlyChangedCandidates
+        $primaryFiles = @($primarySeed | Sort-Object -Unique | Select-Object -First 30)
         if ($primaryFiles.Count -lt 30) {
           $primaryFill = @($allRelPaths | Where-Object { $_ -notin $primaryFiles } | Select-Object -First (30 - $primaryFiles.Count))
           $primaryFiles += $primaryFill
         }
 
-        $deepFiles = @($matchedFileList | Select-Object -First 90)
+        $deepSeed = @()
+        $deepSeed += $matchedFileList
+        $deepSeed += $recentlyChangedCandidates
+        $deepFiles = @($deepSeed | Sort-Object -Unique | Select-Object -First 90)
         if ($deepFiles.Count -lt 90) {
           $deepFill = @($allRelPaths | Where-Object { $_ -notin $deepFiles } | Select-Object -First (90 - $deepFiles.Count))
           $deepFiles += $deepFill
@@ -349,6 +408,7 @@ steps:
 
         $repoStructurePreview = if ($repoStructureRaw) { ($repoStructureRaw -split "`n" | Select-Object -First 700) -join "`n" } else { "" }
         $recentCommitsPreview = if ($recentCommitsRaw) { ($recentCommitsRaw -split "`n" | Select-Object -First 80) -join "`n" } else { "" }
+        $recentlyChangedPreview = if ($recentlyChangedCandidates.Count -gt 0) { ($recentlyChangedCandidates | Select-Object -First 80) -join "`n" } else { "(none)" }
 
         function Build-CodeContext {
           param(
@@ -359,12 +419,14 @@ steps:
             [string]$ModeLabel,
             [string]$RepoRoot,
             [string]$RepoStructureText,
-            [string]$RecentCommitsText
+            [string]$RecentCommitsText,
+            [string]$RecentChangedText
           )
 
           $ctx = "=== ANALYSIS MODE ===`n$ModeLabel`n`n"
           $ctx += "=== REPOSITORY STRUCTURE ===`n$RepoStructureText`n`n"
           $ctx += "=== RECENT COMMITS ===`n$RecentCommitsText`n`n"
+          $ctx += "=== RECENTLY CHANGED FILES (PRIORITY HINT) ===`n$RecentChangedText`n`n"
           $ctx += "=== RELEVANT SOURCE FILES ===`n"
 
           $charsUsed = 0
@@ -411,15 +473,15 @@ steps:
         HEALTH ASSESSMENT SUMMARY: $healthAssessmentSummary
         HEALTH KEY FINDINGS: $healthKeyFindings
 
-        === CONTAINER APP RUNTIME LOGS ===
-        ${{ parameters.containerLogs }}
+        === WEB APP RUNTIME LOGS ===
+        $containerLogs
 
         === CODEBASE CONTEXT ===
         $codeContext
 
         INSTRUCTIONS:
         You are an expert SRE root-cause analysis agent. You have:
-        1. The Container App's actual runtime error logs above
+        1. The Web App's actual runtime error logs above
         2. The source code from the ms-inventory repository
         3. A structured live-health assessment from the Detect stage
 
@@ -434,11 +496,57 @@ steps:
 
         Respond in valid JSON with these keys:
         - rootCauseAnalysis: A detailed explanation of what code is causing the error
-          seen in the Container App logs (2-4 sentences)
+          seen in the Web App logs (2-4 sentences)
         - affectedFiles: Comma-separated list of file paths that need changes (relative to repo root)
         - suggestedFix: A concise description of the code changes needed to fix the error
         - confidence: "high", "medium", or "low"
         "@
+        }
+
+        function Normalize-AffectedFilesString {
+          param([object]$RawValue)
+
+          if ($null -eq $RawValue) {
+            return ""
+          }
+
+          $values = @()
+
+          if ($RawValue -is [System.Array]) {
+            $values = @($RawValue | ForEach-Object { "$_" })
+          } else {
+            $rawText = "$RawValue"
+            if ([string]::IsNullOrWhiteSpace($rawText)) {
+              return ""
+            }
+
+            $rawTrimmed = $rawText.Trim()
+            if ($rawTrimmed.StartsWith("[") -and $rawTrimmed.EndsWith("]")) {
+              try {
+                $parsedList = $rawTrimmed | ConvertFrom-Json -ErrorAction Stop
+                if ($parsedList -is [System.Array]) {
+                  $values = @($parsedList | ForEach-Object { "$_" })
+                } else {
+                  $values = @("$parsedList")
+                }
+              } catch {
+                $values = @($rawText -split '[,;\r\n]+')
+              }
+            } else {
+              $values = @($rawText -split '[,;\r\n]+')
+            }
+          }
+
+          $normalized = @(
+            $values |
+            ForEach-Object { "$_".Trim() } |
+            ForEach-Object { $_ -replace '^\./', '' } |
+            Where-Object { $_ } |
+            Where-Object { $_ -match '[\\/]' -or $_ -match '\.[A-Za-z0-9]+$' } |
+            Sort-Object -Unique
+          )
+
+          return ($normalized -join ", ")
         }
 
         function Parse-DiagnosisJson {
@@ -472,7 +580,26 @@ steps:
           }
 
           if ($parsed.rootCauseAnalysis) { $result.rootCause = "$($parsed.rootCauseAnalysis)" }
-          if ($parsed.affectedFiles)     { $result.affectedFiles = "$($parsed.affectedFiles)" }
+          $rawAffected = $null
+          if ($null -ne $parsed.affectedFiles) { $rawAffected = $parsed.affectedFiles }
+          elseif ($null -ne $parsed.affected_files) { $rawAffected = $parsed.affected_files }
+
+          if ($null -ne $rawAffected) {
+            $result.affectedFiles = Normalize-AffectedFilesString -RawValue $rawAffected
+          }
+
+          if ([string]::IsNullOrWhiteSpace($result.affectedFiles) -and $ResponseText) {
+            $pathMatches = [regex]::Matches(
+              $ResponseText,
+              '(?i)(?:\.\/)?[a-z0-9_./-]+\.(py|js|ts|tsx|jsx|cs|java|go|rb|rs|json|yaml|yml|toml|tf|bicep|sh|ps1|csx)'
+            )
+            if ($pathMatches.Count -gt 0) {
+              $result.affectedFiles = (
+                @($pathMatches | ForEach-Object { $_.Value -replace '^\./', '' } | Sort-Object -Unique) -join ', '
+              )
+            }
+          }
+
           if ($parsed.suggestedFix)      { $result.suggestedFix = "$($parsed.suggestedFix)" }
           if ($parsed.confidence) {
             $conf = "$($parsed.confidence)".ToLower()
@@ -491,9 +618,10 @@ steps:
           -PerFileCharLimit 9000 `
           -TotalCharBudget 90000 `
           -ModeLabel "PRIMARY" `
-          -RepoRoot "${{ parameters.workingDirectory }}" `
+          -RepoRoot $workingDirectory `
           -RepoStructureText $repoStructurePreview `
-          -RecentCommitsText $recentCommitsPreview
+          -RecentCommitsText $recentCommitsPreview `
+          -RecentChangedText $recentlyChangedPreview
 
         Write-Host "Primary context size: $($primaryContextPack.charsUsed) chars across $($primaryContextPack.filesUsed.Count) file(s)."
 
@@ -510,11 +638,11 @@ steps:
           -Context $diagContext `
           -Token $mgmtToken `
           -AIFallbackToken $aiToken `
-          -Endpoint "${{ parameters.azureOpenAIEndpoint }}" `
-          -Deployment "${{ parameters.azureOpenAIDeployment }}" `
+          -Endpoint $azureOpenAIEndpoint `
+          -Deployment $azureOpenAIDeployment `
           -SubscriptionId $subscriptionId `
-          -SREAgentName "${{ parameters.sreAgentName }}" `
-          -SREAgentResourceGroup "${{ parameters.sreAgentResourceGroup }}"
+          -SREAgentName $sreAgentName `
+          -SREAgentResourceGroup $sreAgentResourceGroup
 
         if ($sreResult.success) {
           $analysisResponseText = "$($sreResult.response)"
@@ -542,6 +670,7 @@ steps:
 
         $needsDeepAnalysis = (-not $primaryParsed.success) -or ($confidence -eq "low") -or [string]::IsNullOrWhiteSpace($affFiles)
 
+        $deepContextPack = $null
         if ($needsDeepAnalysis) {
           Write-Host "`nLow-confidence diagnosis detected — running deep second-pass analysis." -ForegroundColor Yellow
 
@@ -551,9 +680,10 @@ steps:
             -PerFileCharLimit 12000 `
             -TotalCharBudget 170000 `
             -ModeLabel "DEEP-SECOND-PASS" `
-            -RepoRoot "${{ parameters.workingDirectory }}" `
+            -RepoRoot $workingDirectory `
             -RepoStructureText $repoStructurePreview `
-            -RecentCommitsText $recentCommitsPreview
+            -RecentCommitsText $recentCommitsPreview `
+            -RecentChangedText $recentlyChangedPreview
 
           Write-Host "Deep context size: $($deepContextPack.charsUsed) chars across $($deepContextPack.filesUsed.Count) file(s)."
 
@@ -561,30 +691,42 @@ steps:
           $deepResponseText = ""
           $deepSuccess = $false
 
-          if (-not [string]::IsNullOrWhiteSpace("${{ parameters.azureOpenAIEndpoint }}") -and -not [string]::IsNullOrWhiteSpace($aiToken)) {
+          if (-not [string]::IsNullOrWhiteSpace($azureOpenAIEndpoint) -and -not [string]::IsNullOrWhiteSpace($aiToken)) {
             Write-Host "Deep pass provider: Azure OpenAI direct endpoint" -ForegroundColor Cyan
             $analysisProvider = "azure-openai-direct"
             $analysisMode = "deep-second-pass"
 
-            $systemPrompt = @"
-            You are an expert SRE root-cause analysis agent.
-            Analyze the full context and return ONLY valid JSON with keys:
-            rootCauseAnalysis, affectedFiles, suggestedFix, confidence.
-            Confidence must be one of: high, medium, low.
-            "@
+            $systemPrompt = @(
+              "You are an expert SRE root-cause analysis agent.",
+              "Analyze the full context and return ONLY valid JSON with keys:",
+              "rootCauseAnalysis, affectedFiles, suggestedFix, confidence.",
+              "Confidence must be one of: high, medium, low."
+            ) -join "`n"
 
-            $openAiBody = @{
-              model = "${{ parameters.azureOpenAIDeployment }}"
-              max_completion_tokens = 16384
-              reasoning_effort = "high"
-              messages = @(
-                @{ role = "system"; content = $systemPrompt }
-                @{ role = "user"; content = $deepDiagContext }
-              )
-            } | ConvertTo-Json -Depth 10
+            $isResponsesEndpoint = $azureOpenAIEndpoint.ToLowerInvariant() -match '/responses(\?|$)'
+
+            if ($isResponsesEndpoint) {
+              $openAiBody = @{
+                model = $azureOpenAIDeployment
+                input = @(
+                  @{ role = "system"; content = $systemPrompt }
+                  @{ role = "user"; content = $deepDiagContext }
+                )
+                max_output_tokens = 16384
+              } | ConvertTo-Json -Depth 10
+            } else {
+              $openAiBody = @{
+                model = $azureOpenAIDeployment
+                messages = @(
+                  @{ role = "system"; content = $systemPrompt }
+                  @{ role = "user"; content = $deepDiagContext }
+                )
+                max_completion_tokens = 16384
+              } | ConvertTo-Json -Depth 10
+            }
 
             try {
-              $deepRaw = Invoke-RestMethod -Uri "${{ parameters.azureOpenAIEndpoint }}" `
+              $deepRaw = Invoke-RestMethod -Uri $azureOpenAIEndpoint `
                 -Method POST `
                 -Headers @{ "Authorization" = "Bearer $aiToken"; "Content-Type" = "application/json" } `
                 -Body $openAiBody `
@@ -612,11 +754,11 @@ steps:
               -Context $deepDiagContext `
               -Token $mgmtToken `
               -AIFallbackToken $aiToken `
-              -Endpoint "${{ parameters.azureOpenAIEndpoint }}" `
-              -Deployment "${{ parameters.azureOpenAIDeployment }}" `
+              -Endpoint $azureOpenAIEndpoint `
+              -Deployment $azureOpenAIDeployment `
               -SubscriptionId $subscriptionId `
-              -SREAgentName "${{ parameters.sreAgentName }}" `
-              -SREAgentResourceGroup "${{ parameters.sreAgentResourceGroup }}"
+              -SREAgentName $sreAgentName `
+              -SREAgentResourceGroup $sreAgentResourceGroup
 
             if ($deepResult.success) {
               $deepResponseText = "$($deepResult.response)"
@@ -640,6 +782,43 @@ steps:
             }
           } else {
             Write-Host "##[warning]Deep second-pass analysis failed; keeping primary diagnosis"
+          }
+        }
+
+        $affFiles = Normalize-AffectedFilesString -RawValue $affFiles
+
+        if ([string]::IsNullOrWhiteSpace($affFiles)) {
+          $fallbackCandidates = @()
+
+          if ($recentlyChangedCandidates.Count -gt 0) {
+            $fallbackCandidates += @($recentlyChangedCandidates | Select-Object -First 5)
+          }
+          if ($matchedFileList.Count -gt 0) {
+            $fallbackCandidates += @($matchedFileList | Select-Object -First 5)
+          }
+          if ($fallbackCandidates.Count -eq 0 -and $primaryContextPack -and $primaryContextPack.filesUsed) {
+            $fallbackCandidates += @($primaryContextPack.filesUsed | Select-Object -First 5)
+          }
+          if ($fallbackCandidates.Count -eq 0 -and $deepContextPack -and $deepContextPack.filesUsed) {
+            $fallbackCandidates += @($deepContextPack.filesUsed | Select-Object -First 5)
+          }
+          if ($fallbackCandidates.Count -eq 0 -and $allRelPaths.Count -gt 0) {
+            $fallbackCandidates += @($allRelPaths | Select-Object -First 3)
+          }
+
+          $fallbackCandidates = @(
+            $fallbackCandidates |
+            ForEach-Object { "$_".Trim() -replace '^\./', '' } |
+            Where-Object { $_ } |
+            Sort-Object -Unique
+          )
+
+          if ($fallbackCandidates.Count -gt 0) {
+            $affFiles = ($fallbackCandidates -join ', ')
+            Write-Host "##[warning]Diagnosis produced no affected files; using fallback candidates: $affFiles"
+            if ($confidence -eq 'high') {
+              $confidence = 'medium'
+            }
           }
         }
 
@@ -676,6 +855,13 @@ steps:
         # Save full analysis artifact
         $responseToPersist = if ($analysisResponseText) { $analysisResponseText } else { $rootCause }
         $responseToPersist | Out-File -FilePath "$(Build.ArtifactStagingDirectory)/root_cause_analysis.txt" -Encoding utf8
+
+    env:
+      DIAG_WORKING_DIRECTORY: '${{ parameters.workingDirectory }}'
+      DIAG_OPENAI_ENDPOINT: '${{ parameters.azureOpenAIEndpoint }}'
+      DIAG_OPENAI_DEPLOYMENT: '${{ parameters.azureOpenAIDeployment }}'
+      DIAG_SRE_AGENT_NAME: '${{ parameters.sreAgentName }}'
+      DIAG_SRE_AGENT_RESOURCE_GROUP: '${{ parameters.sreAgentResourceGroup }}'
 
   # ── Publish diagnosis artifacts ────────────────────────────────────────────
   - task: PublishPipelineArtifact@1
