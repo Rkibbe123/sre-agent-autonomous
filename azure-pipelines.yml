@@ -65,6 +65,10 @@ parameters:
     displayName: 'Incident / Alert ID'
     type: string
     default: 'AUTO'
+  - name: enableAutoApproveAndComplete
+    displayName: 'Enable Auto-Approve & Auto-Complete'
+    type: string
+    default: 'false'
 
   # ── Web App settings ──
   - name: containerAppName
@@ -250,6 +254,11 @@ stages:
       - job: CreatePR
         displayName: 'Create Pull Request'
         steps:
+          - checkout: self
+          - checkout: targetAppRepo
+            path: target-repo
+            persistCredentials: 'true'
+
           - template: templates/sre-agent-common.yml
             parameters:
               azureServiceConnection: 'azure-devops-sp2'
@@ -274,3 +283,4 @@ stages:
               fixSummary: $(fixSummary)
               changedFiles: $(changedFiles)
               testResults: $(testResults)
+              enableAutoApproveAndComplete: ${{ parameters.enableAutoApproveAndComplete }}

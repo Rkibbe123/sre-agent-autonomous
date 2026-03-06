@@ -37,6 +37,9 @@ parameters:
     type: string
   - name: testResults
     type: string
+  - name: enableAutoApproveAndComplete
+    type: string
+    default: 'false'
 
 steps:
   # ── Create the Pull Request via Azure DevOps REST API ──────────────────────
@@ -74,20 +77,37 @@ steps:
 
         # ── Look up repository ID ──
         Write-Host "Looking up repository: $repoName"
-        $reposUrl = "$orgUrl/$projectEncoded/_apis/git/repositories?api-version=7.1"
-        $reposResp = Invoke-RestMethod -Uri $reposUrl -Headers @{ Authorization = "Basic $encodedPat" } -TimeoutSec 30
+        $repo = $null
 
-        $repo = $reposResp.value | Where-Object { $_.name -ieq $repoName } | Select-Object -First 1
-        if (-not $repo) {
-          $repo = $reposResp.value | Where-Object { $_.remoteUrl -match [regex]::Escape($repoName) } | Select-Object -First 1
+        $repoByNameUrl = "$orgUrl/$projectEncoded/_apis/git/repositories/$repoEncoded?api-version=7.1"
+        try {
+          $repoByName = Invoke-RestMethod -Uri $repoByNameUrl -Headers @{ Authorization = "Basic $encodedPat" } -TimeoutSec 30
+          if ($repoByName -and $repoByName.id) {
+            $repo = $repoByName
+          }
+        } catch {
+          Write-Host "##[warning]Direct repository lookup by name failed. Falling back to repository listing."
         }
+
+        if (-not $repo) {
+          $reposUrl = "$orgUrl/$projectEncoded/_apis/git/repositories?api-version=7.1"
+          $reposResp = Invoke-RestMethod -Uri $reposUrl -Headers @{ Authorization = "Basic $encodedPat" } -TimeoutSec 30
+
+          $repo = $reposResp.value | Where-Object { $_.name -ieq $repoName } | Select-Object -First 1
+          if (-not $repo) {
+            $repo = $reposResp.value | Where-Object { $_.remoteUrl -match [regex]::Escape($repoName) } | Select-Object -First 1
+          }
+        }
+
         if (-not $repo) {
           Write-Host "##[error]Repository '$repoName' not found."
           Write-Host "Available: $($reposResp.value.name -join ', ')"
+          Write-Host "##[error]If this pipeline has repository-scoped job tokens enabled, ensure this PR job checks out 'targetAppRepo' so System.AccessToken can see '$repoName'."
           exit 1
         }
 
         $repoId = $repo.id
+        Write-Host "Repository resolved: $($repo.name)"
         Write-Host "Repository ID: $repoId"
 
         # ── Build severity badge ──
@@ -168,15 +188,18 @@ steps:
 
         $prId  = $prResp.pullRequestId
         $prWeb = "$orgUrl/$projectEncoded/_git/$repoEncoded/pullrequest/$prId"
+        $prStatus = if ($prResp.status) { "$($prResp.status)" } else { "unknown" }
 
         Write-Host "##vso[task.setvariable variable=prId;isOutput=true]$prId"
         Write-Host "##vso[task.setvariable variable=prUrl;isOutput=true]$prWeb"
         Write-Host "##vso[task.setvariable variable=repositoryId;isOutput=true]$repoId"
+        Write-Host "##vso[task.setvariable variable=prStatus;isOutput=true]$prStatus"
 
         Write-Host ""
         Write-Host "PR CREATED:" -ForegroundColor Green
         Write-Host "  PR ID:  $prId"
         Write-Host "  PR URL: $prWeb"
+        Write-Host "  Status: $prStatus"
 
   # ── Add detailed analysis comment to the PR ────────────────────────────────
   - task: AzureCLI@2
@@ -199,17 +222,32 @@ steps:
         $encodedPat  = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(":$pat"))
         $buildUrl    = "$orgUrl/$projectEncoded/_build/results?buildId=$(Build.BuildId)"
 
+        $fixSummaryText = "${{ parameters.fixSummary }}"
+        $changedFilesText = "${{ parameters.changedFiles }}"
+        $testResultsText = "${{ parameters.testResults }}"
+
+        $changedFileList = @(
+          $changedFilesText -split '[,;]' |
+          ForEach-Object { "$_.Trim()" } |
+          Where-Object { $_ }
+        )
+        $changedFilesBulletList = if ($changedFileList.Count -gt 0) {
+          ($changedFileList | ForEach-Object { "- ``$_``" }) -join "`n"
+        } else {
+          "- (none)"
+        }
+
         $comment = @"
         ## SRE Agent Analysis Report
 
         ### Root Cause & Fix
-        ${{ parameters.fixSummary }}
+        $fixSummaryText
 
         ### Files Modified
-        $((${{ parameters.changedFiles }} -split '[,;]' | ForEach-Object { "- ``$($_.Trim())``" }) -join "`n")
+        $changedFilesBulletList
 
         ### Validation Results
-        ${{ parameters.testResults }}
+        $testResultsText
 
         ### Pipeline Details
         [View full pipeline run]($buildUrl)
@@ -244,6 +282,12 @@ steps:
       scriptType: pscore
       scriptLocation: inlineScript
       inlineScript: |
+        $enableAuto = "${{ parameters.enableAutoApproveAndComplete }}".Trim().ToLower()
+        if ($enableAuto -ne "true") {
+          Write-Host "Auto-approve/auto-complete disabled by pipeline setting. Leaving PR open for manual review." -ForegroundColor Yellow
+          return
+        }
+
         $severity = "${{ parameters.severity }}"
 
         if ($severity -in @("high", "critical")) {
@@ -303,7 +347,7 @@ steps:
         }
 
         Write-Host ""
-        Write-Host "PR #$prId: auto-approved + auto-complete ($severity severity)" -ForegroundColor Green
+        Write-Host "PR #${prId}: auto-approved + auto-complete ($severity severity)" -ForegroundColor Green
 
   # ── Final summary ──────────────────────────────────────────────────────────
   - task: PowerShell@2

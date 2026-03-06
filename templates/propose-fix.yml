@@ -88,7 +88,7 @@ steps:
             $cloneUrl = "$orgUrl/$projectEncoded/_git/$repoEncoded"
           }
           Write-Host "Cloning: $cloneUrl"
-          git -c http.extraHeader="Authorization: Basic $encodedPat" clone `
+          git -c http.extraHeader="AUTHORIZATION: bearer $pat" clone `
             --branch "${{ parameters.targetBranch }}" --depth 50 `
             "$cloneUrl" "$workDir"
         }
@@ -98,7 +98,6 @@ steps:
         # Configure git for commits
         git config user.email "sre-agent@devops.azure.com"
         git config user.name "SRE Autonomous Agent"
-        git config http.extraHeader "Authorization: Basic $encodedPat"
 
         # Create fix branch
         git checkout -b "${{ parameters.fixBranch }}"
@@ -388,7 +387,7 @@ steps:
 
         # Detect project type
         $projectType = "unknown"
-        if (Test-Path "requirements.txt" -or Test-Path "pyproject.toml" -or Test-Path "setup.py") { $projectType = "python" }
+        if ((Test-Path "requirements.txt") -or (Test-Path "pyproject.toml") -or (Test-Path "setup.py")) { $projectType = "python" }
         elseif (Test-Path "package.json") { $projectType = "node" }
         elseif (Get-ChildItem -Filter "*.csproj" -Recurse -Depth 2) { $projectType = "dotnet" }
         elseif (Test-Path "go.mod") { $projectType = "go" }
@@ -442,9 +441,80 @@ steps:
       inlineScript: |
         Set-Location "${{ parameters.workingDirectory }}"
 
+        $orgUrl = "$(System.CollectionUri)".TrimEnd("/")
+        $project = "${{ parameters.targetProject }}"
+        $repoName = "${{ parameters.targetRepo }}"
         $pat = "$(System.AccessToken)"
-        $encodedPat = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(":$pat"))
-        git config http.extraHeader "Authorization: Basic $encodedPat"
+        if ([string]::IsNullOrWhiteSpace($pat)) {
+          Write-Host "##[error]System.AccessToken is empty. Enable OAuth token access for the pipeline and grant repo push permissions."
+          exit 1
+        }
+
+        $projectEncoded = [System.Uri]::EscapeDataString($project)
+        $repoEncoded = [System.Uri]::EscapeDataString($repoName)
+        $reposUrl = "$orgUrl/$projectEncoded/_apis/git/repositories?api-version=7.1"
+        $canonicalRemoteUrl = ""
+
+        try {
+          $reposResp = Invoke-RestMethod -Uri $reposUrl -Headers @{ Authorization = "Bearer $pat" } -TimeoutSec 30
+          $repo = $reposResp.value | Where-Object { $_.name -ieq $repoName -or $_.id -eq $repoName } | Select-Object -First 1
+          if ($repo -and $repo.remoteUrl) {
+            $canonicalRemoteUrl = "$($repo.remoteUrl)".TrimEnd('/')
+            git remote set-url origin "$canonicalRemoteUrl"
+          }
+        } catch {
+          Write-Host "##[warning]Could not resolve canonical remote URL via REST API. Using existing origin URL."
+        }
+
+        $originUrl = (git remote get-url origin 2>$null)
+        if (-not [string]::IsNullOrWhiteSpace($originUrl)) {
+          $originUrl = "$originUrl".TrimEnd('/')
+          git remote set-url origin "$originUrl"
+          Write-Host "Using remote: $originUrl"
+        }
+
+        $explicitPushUrl = if (-not [string]::IsNullOrWhiteSpace($canonicalRemoteUrl)) {
+          $canonicalRemoteUrl
+        } else {
+          "$orgUrl/$projectEncoded/_git/$repoEncoded"
+        }
+        $explicitPushUrl = "$explicitPushUrl".TrimEnd('/')
+
+        function Test-ContributePermissionDenied {
+          param([string]$Text)
+          return ($Text -match 'TF401027') -or ($Text -match 'GenericContribute')
+        }
+
+        function Complete-PermissionDenied {
+          param([string]$RemoteUrl)
+
+          Write-Host "##[warning]Push blocked by missing Git GenericContribute permission."
+          Write-Host "##[warning]Grant 'Contribute' and 'Create branch' on '${{ parameters.targetRepo }}' to the build identity shown in the error."
+          Write-Host "##[warning]Remote URL used: $RemoteUrl"
+          Write-Host "##vso[task.setvariable variable=pushSkipped;isOutput=true]true"
+          Write-Host "##vso[task.setvariable variable=pushFailureReason;isOutput=true]missing-genericcontribute"
+          Write-Host "##vso[task.complete result=SucceededWithIssues;]Push skipped due to missing repository permissions. Generated patch artifact is available for manual apply."
+          exit 0
+        }
+
+        function Invoke-GitPushAttempt {
+          param(
+            [string]$Mode,
+            [ScriptBlock]$PushScript
+          )
+
+          Write-Host "Push attempt ($Mode)..."
+          $output = & $PushScript 2>&1
+          $exitCode = $LASTEXITCODE
+          foreach ($line in @($output)) {
+            Write-Host "$line"
+          }
+
+          return [PSCustomObject]@{
+            ExitCode = $exitCode
+            Output = (@($output) -join "`n")
+          }
+        }
 
         git add -A
 
@@ -459,10 +529,66 @@ steps:
 
         git commit -m ($commitMsg.Trim())
 
-        git push origin "${{ parameters.fixBranch }}"
-        if ($LASTEXITCODE -ne 0) {
+        $patchDir = "$(Build.ArtifactStagingDirectory)"
+        New-Item -ItemType Directory -Path $patchDir -Force | Out-Null
+        $patchPath = Join-Path $patchDir "generated_fix.patch"
+        try {
+          git format-patch -1 --stdout | Out-File -FilePath $patchPath -Encoding utf8
+          if (Test-Path $patchPath) {
+            Write-Host "Saved generated patch artifact: $patchPath"
+          }
+          $global:LASTEXITCODE = 0
+        } catch {
+          Write-Host "##[warning]Failed to export patch artifact: $($_.Exception.Message)"
+          $global:LASTEXITCODE = 0
+        }
+
+        # Try push with persisted checkout credentials first
+        $pushResult = Invoke-GitPushAttempt -Mode "persisted-credentials" -PushScript {
+          git push --set-upstream origin "${{ parameters.fixBranch }}"
+        }
+
+        if ($pushResult.ExitCode -ne 0) {
+          if (Test-ContributePermissionDenied -Text $pushResult.Output) {
+            Complete-PermissionDenied -RemoteUrl $explicitPushUrl
+          }
+
+          Write-Host "##[warning]Push with persisted credentials failed. Retrying with explicit Bearer token header."
+          $pushResult = Invoke-GitPushAttempt -Mode "origin-with-bearer" -PushScript {
+            git -c http.extraHeader="AUTHORIZATION: bearer $pat" push --set-upstream origin "${{ parameters.fixBranch }}"
+          }
+        }
+
+        if ($pushResult.ExitCode -ne 0) {
+          if (Test-ContributePermissionDenied -Text $pushResult.Output) {
+            Complete-PermissionDenied -RemoteUrl $explicitPushUrl
+          }
+
+          Write-Host "##[warning]Push via origin failed again. Retrying with explicit repository URL."
+          $pushResult = Invoke-GitPushAttempt -Mode "explicit-url-with-bearer" -PushScript {
+            git -c http.extraHeader="AUTHORIZATION: bearer $pat" push "$explicitPushUrl" "HEAD:refs/heads/${{ parameters.fixBranch }}"
+          }
+        }
+
+        if ($pushResult.ExitCode -ne 0) {
+          if (Test-ContributePermissionDenied -Text $pushResult.Output) {
+            Complete-PermissionDenied -RemoteUrl $explicitPushUrl
+          }
+
           Write-Host "##[error]Failed to push fix branch"
+          Write-Host "##[error]Ensure the pipeline identity has Contribute/Create branch permissions on '${{ parameters.targetRepo }}'."
+          Write-Host "##[error]Remote URL used: $explicitPushUrl"
           exit 1
         }
 
+        Write-Host "##vso[task.setvariable variable=pushSkipped;isOutput=true]false"
+        Write-Host "##vso[task.setvariable variable=pushFailureReason;isOutput=true]none"
         Write-Host "Pushed branch: ${{ parameters.fixBranch }}" -ForegroundColor Green
+
+  - task: PublishPipelineArtifact@1
+    displayName: 'Publish generated fix artifacts'
+    condition: always()
+    inputs:
+      targetPath: '$(Build.ArtifactStagingDirectory)'
+      artifact: 'generated-fix'
+      publishLocation: 'pipeline'
