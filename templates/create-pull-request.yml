@@ -39,7 +39,7 @@ parameters:
     type: string
   - name: enableAutoApproveAndComplete
     type: string
-    default: 'false'
+    default: 'true'
 
 steps:
   # ── Create the Pull Request via Azure DevOps REST API ──────────────────────
@@ -274,9 +274,9 @@ steps:
 
         Write-Host "Analysis comment added to PR #$prId" -ForegroundColor Green
 
-  # ── Auto-approve & auto-complete (low/medium severity) ─────────────────────
+  # ── Auto-approve & auto-complete (all severities) ──────────────────────────
   - task: AzureCLI@2
-    displayName: 'Auto-approve & auto-complete (low/medium only)'
+    displayName: 'Auto-approve & auto-complete'
     inputs:
       azureSubscription: '${{ parameters.azureServiceConnection }}'
       scriptType: pscore
@@ -289,11 +289,6 @@ steps:
         }
 
         $severity = "${{ parameters.severity }}"
-
-        if ($severity -in @("high", "critical")) {
-          Write-Host "Severity is '$severity' — auto-approve NOT enabled. Human review required." -ForegroundColor Yellow
-          return
-        }
 
         Write-Host "Severity is '$severity' — auto-approving PR..." -ForegroundColor Green
 

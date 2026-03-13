@@ -173,31 +173,77 @@ steps:
             $result = @{ success = $false; response = ""; raw = $null }
 
             # Try SRE Agent REST API first (if resource is provisioned)
+            # Uses the threads-based data-plane API at sre.azure.com
+            # (POST /actions on management.azure.com is not a supported operation)
             if ($SREAgentName -and $SREAgentResourceGroup -and $SubscriptionId) {
                 try {
-                    $sreApiBase = "https://management.azure.com/subscriptions/$SubscriptionId/resourceGroups/$SREAgentResourceGroup/providers/Microsoft.App/agents/$SREAgentName"
+                    $sreApiBase = "https://sre.azure.com/subscriptions/$SubscriptionId/resourceGroups/$SREAgentResourceGroup/providers/Microsoft.App/agents/$SREAgentName"
                     $apiVersion = "2025-05-01-preview"
+                    $authHeaders = @{
+                        "Authorization" = "Bearer $Token"
+                        "Content-Type"  = "application/json"
+                    }
 
-                    $sreBody = @{
-                        properties = @{
-                            action = $Action
-                            targetResourceId = $TargetResourceId
-                            context = $Context
-                        }
-                    } | ConvertTo-Json -Depth 10
-
-                    $sreResponse = Invoke-RestMethod -Uri "$sreApiBase/actions?api-version=$apiVersion" `
+                    # Step 1: Create a thread
+                    $threadResp = Invoke-RestMethod `
+                        -Uri "$sreApiBase/threads?api-version=$apiVersion" `
                         -Method POST `
-                        -Headers @{
-                            "Authorization" = "Bearer $Token"
-                            "Content-Type" = "application/json"
-                        } `
-                        -Body $sreBody `
-                        -TimeoutSec 120
+                        -Headers $authHeaders `
+                        -Body "{}" `
+                        -TimeoutSec 30
+                    $threadId = $threadResp.id
+                    if (-not $threadId) { throw "Thread creation returned no id" }
+
+                    # Step 2: Add a user message
+                    $userContent = "**ACTION:** $Action`n**RESOURCE:** $TargetResourceId`n`n$Context"
+                    $msgBody = @{ role = "user"; content = $userContent } | ConvertTo-Json -Depth 5
+                    $null = Invoke-RestMethod `
+                        -Uri "$sreApiBase/threads/$threadId/messages?api-version=$apiVersion" `
+                        -Method POST `
+                        -Headers $authHeaders `
+                        -Body $msgBody `
+                        -TimeoutSec 30
+
+                    # Step 3: Create a run
+                    $runResp = Invoke-RestMethod `
+                        -Uri "$sreApiBase/threads/$threadId/runs?api-version=$apiVersion" `
+                        -Method POST `
+                        -Headers $authHeaders `
+                        -Body "{}" `
+                        -TimeoutSec 30
+                    $runId = $runResp.id
+                    if (-not $runId) { throw "Run creation returned no id" }
+
+                    # Step 4: Poll for completion (max 120 s)
+                    $maxWait = 120; $waited = 0; $pollSec = 5; $runStatus = ""
+                    while ($waited -lt $maxWait) {
+                        Start-Sleep -Seconds $pollSec
+                        $waited += $pollSec
+                        $pollResp = Invoke-RestMethod `
+                            -Uri "$sreApiBase/threads/$threadId/runs/$runId?api-version=$apiVersion" `
+                            -Method GET `
+                            -Headers $authHeaders `
+                            -TimeoutSec 30
+                        $runStatus = $pollResp.status
+                        if ($runStatus -in @("completed", "failed", "cancelled", "expired")) { break }
+                    }
+
+                    if ($runStatus -ne "completed") { throw "Run ended with status: $runStatus" }
+
+                    # Step 5: Retrieve the latest assistant message
+                    $msgsResp = Invoke-RestMethod `
+                        -Uri "$sreApiBase/threads/$threadId/messages?api-version=$apiVersion&order=desc&limit=10" `
+                        -Method GET `
+                        -Headers $authHeaders `
+                        -TimeoutSec 30
+                    $assistantMsg = @($msgsResp.data | Where-Object { $_.role -eq "assistant" }) | Select-Object -First 1
+                    if (-not $assistantMsg) { throw "No assistant message found in thread $threadId" }
+                    $textContent = @($assistantMsg.content | Where-Object { $_.type -eq "text" }) | Select-Object -First 1
+                    $responseText = if ($textContent) { $textContent.text.value } else { $assistantMsg.content | ConvertTo-Json -Depth 5 }
 
                     $result.success = $true
-                    $result.raw = $sreResponse
-                    $result.response = $sreResponse | ConvertTo-Json -Depth 10
+                    $result.response = $responseText
+                    $result.raw = $msgsResp
                     return $result
                 } catch {
                     Write-Host "  SRE Agent API call failed, falling back to AI agent: $_" -ForegroundColor Yellow

@@ -68,7 +68,7 @@ parameters:
   - name: enableAutoApproveAndComplete
     displayName: 'Enable Auto-Approve & Auto-Complete'
     type: string
-    default: 'false'
+    default: 'true'
 
   # ── Web App settings ──
   - name: containerAppName
